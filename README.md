@@ -140,22 +140,20 @@ The incremental hot path reuses subtrees aggressively — a single-byte edit rep
 
 ## Supported Languages
 
-33 languages. Run `go run ./cmd/parity_report` to verify.
+90 registered languages. Run `go run ./cmd/parity_report` for the current per-language status.
 
-Current registry:
-`agda`, `bash`, `c`, `c_sharp`, `cpp`, `css`, `elixir`, `embedded_template`, `go`, `haskell`, `html`, `java`, `javascript`, `json`, `julia`, `kotlin`, `lua`, `nix`, `ocaml`, `php`, `python`, `regex`, `ruby`, `rust`, `scala`, `sql`, `swift`, `toml`, `tsx`, `typescript`, `verilog`, `yaml`, `zig`
-
-Current parity-report summary:
-- `parseable=33`
-- `total=33`
+Current parity-report summary for this branch:
+- `parseable=90`
+- `total=90`
 - `unsupported=0`
+- `degraded=21`
 
 **Backend types:**
 - **`dfa`** — lexer fully generated from grammar tables
 - **`dfa-partial`** — generated DFA with partial external-scanner coverage; runtime synthesizes remaining tokens
 - **`token_source`** — hand-written pure-Go lexer bridge
 
-**`degraded`** means the language parses and produces a tree, but the smoke parse still reports recoverable syntax errors (currently: `agda`, `c_sharp`, `elixir`, `haskell`, `swift`, `yaml`).
+**`degraded`** means the language parses and produces a tree, but the smoke parse still reports recoverable syntax errors (commonly missing external scanner coverage or known lexer parity gaps). Use `go run ./cmd/parity_report` to see the live degraded set.
 
 ---
 
@@ -179,8 +177,10 @@ Current parity-report summary:
 **2.** Generate bindings:
 
 ```sh
-go run ./cmd/ts2go -manifest grammars/languages.manifest -outdir ./grammars -package grammars
+go run ./cmd/ts2go -manifest grammars/languages.manifest -outdir ./grammars -package grammars -compact=true
 ```
+
+This regenerates `grammars/embedded_grammars_gen.go`, `grammars/grammar_blobs/*.bin`, and language register stubs.
 
 **3.** Add smoke samples to `cmd/parity_report/main.go` and `grammars/parse_support_test.go`.
 
@@ -206,7 +206,48 @@ gotreesitter reimplements the tree-sitter runtime in pure Go:
 - **External scanner VM** — bytecode interpreter for language-specific scanning (Python indentation, etc.)
 - **Query engine** — full S-expression pattern matching with predicate evaluation and streaming cursors
 
-Grammar tables are extracted from upstream tree-sitter `parser.c` files by the `ts2go` tool and compiled into Go source. No C code runs at parse time.
+Grammar tables are extracted from upstream tree-sitter `parser.c` files by the `ts2go` tool, serialized into compressed binary blobs, and lazy-loaded on first language use. No C code runs at parse time.
+
+To avoid embedding blobs into the binary, build with `-tags grammar_blobs_external` and set `GOTREESITTER_GRAMMAR_BLOB_DIR` to a directory containing `*.bin` grammar blobs. External blob mode uses `mmap` on Unix by default (`GOTREESITTER_GRAMMAR_BLOB_MMAP=false` to disable).
+
+To ship a smaller embedded binary with a curated language set, build with `-tags grammar_set_core` (core set includes common languages like `c`, `go`, `java`, `javascript`, `python`, `rust`, `typescript`, etc.).
+
+To restrict registered languages at runtime (embedded or external), set:
+
+```sh
+GOTREESITTER_GRAMMAR_SET=go,json,python
+```
+
+For long-lived processes, grammar cache memory is tunable:
+
+```go
+// Keep only the 8 most recently used decoded grammars in cache.
+grammars.SetEmbeddedLanguageCacheLimit(8)
+
+// Drop one language blob from cache (e.g. "rust.bin").
+grammars.UnloadEmbeddedLanguage("rust.bin")
+
+// Drop all decoded grammars from cache.
+grammars.PurgeEmbeddedLanguageCache()
+```
+
+You can also set `GOTREESITTER_GRAMMAR_CACHE_LIMIT` at process start to apply a cache cap without code changes.
+Set it to `0` only when you explicitly want no retention (each grammar access will decode again).
+
+Idle eviction can be enabled with env vars:
+
+```sh
+GOTREESITTER_GRAMMAR_IDLE_TTL=5m
+GOTREESITTER_GRAMMAR_IDLE_SWEEP=30s
+```
+
+Loader compaction/interning is enabled by default and tunable via:
+
+```sh
+GOTREESITTER_GRAMMAR_COMPACT=true
+GOTREESITTER_GRAMMAR_STRING_INTERN_LIMIT=200000
+GOTREESITTER_GRAMMAR_TRANSITION_INTERN_LIMIT=20000
+```
 
 ---
 

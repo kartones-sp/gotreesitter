@@ -1,0 +1,303 @@
+package grammars
+
+import (
+	"bytes"
+	"compress/gzip"
+	"container/list"
+	"encoding/gob"
+	"fmt"
+	"os"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/odvcencio/gotreesitter"
+)
+
+type embeddedLanguageCacheEntry struct {
+	blobName   string
+	lruNode    *list.Element
+	lastAccess time.Time
+	once       sync.Once
+	lang       *gotreesitter.Language
+	err        error
+}
+
+var (
+	embeddedLanguageCacheMu sync.Mutex
+	embeddedLanguageCache   = map[string]*embeddedLanguageCacheEntry{}
+	embeddedLanguageLRU     list.List
+	embeddedLanguageLimit   = -1 // -1 = unlimited
+
+	embeddedLanguageIdleTTL      time.Duration
+	embeddedLanguageIdleSweep    = 30 * time.Second
+	embeddedLanguageJanitorStop  chan struct{}
+	embeddedLanguageJanitorAlive bool
+)
+
+func init() {
+	if raw := os.Getenv("GOTREESITTER_GRAMMAR_CACHE_LIMIT"); raw != "" {
+		limit, err := strconv.Atoi(raw)
+		if err == nil {
+			SetEmbeddedLanguageCacheLimit(limit)
+		}
+	}
+	if raw := os.Getenv("GOTREESITTER_GRAMMAR_IDLE_SWEEP"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil {
+			SetEmbeddedLanguageIdleSweepInterval(d)
+		}
+	}
+	if raw := os.Getenv("GOTREESITTER_GRAMMAR_IDLE_TTL"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil {
+			SetEmbeddedLanguageIdleTTL(d)
+		}
+	}
+}
+
+func loadEmbeddedLanguage(blobName string) *gotreesitter.Language {
+	entry := getEmbeddedLanguageCacheEntry(blobName)
+	entry.once.Do(func() {
+		entry.lang, entry.err = decodeEmbeddedLanguage(blobName)
+	})
+	if entry.err != nil {
+		panic(entry.err)
+	}
+	recordEmbeddedLanguageUse(entry)
+	return entry.lang
+}
+
+func getEmbeddedLanguageCacheEntry(blobName string) *embeddedLanguageCacheEntry {
+	embeddedLanguageCacheMu.Lock()
+	defer embeddedLanguageCacheMu.Unlock()
+	if entry, ok := embeddedLanguageCache[blobName]; ok {
+		return entry
+	}
+	entry := &embeddedLanguageCacheEntry{blobName: blobName}
+	embeddedLanguageCache[blobName] = entry
+	return entry
+}
+
+func recordEmbeddedLanguageUse(entry *embeddedLanguageCacheEntry) {
+	embeddedLanguageCacheMu.Lock()
+	defer embeddedLanguageCacheMu.Unlock()
+
+	now := time.Now()
+	entry.lastAccess = now
+
+	if embeddedLanguageLimit == 0 {
+		removeEmbeddedLanguageEntryLocked(entry)
+		return
+	}
+
+	if _, ok := embeddedLanguageCache[entry.blobName]; !ok {
+		embeddedLanguageCache[entry.blobName] = entry
+	}
+	if entry.lruNode != nil {
+		embeddedLanguageLRU.MoveToFront(entry.lruNode)
+	} else {
+		entry.lruNode = embeddedLanguageLRU.PushFront(entry)
+	}
+
+	enforceEmbeddedLanguageLimitLocked()
+	evictIdleEmbeddedLanguagesLocked(now)
+}
+
+func removeEmbeddedLanguageEntryLocked(entry *embeddedLanguageCacheEntry) {
+	if entry == nil {
+		return
+	}
+	delete(embeddedLanguageCache, entry.blobName)
+	if entry.lruNode != nil {
+		embeddedLanguageLRU.Remove(entry.lruNode)
+		entry.lruNode = nil
+	}
+}
+
+func enforceEmbeddedLanguageLimitLocked() {
+	if embeddedLanguageLimit < 0 {
+		return
+	}
+	for len(embeddedLanguageCache) > embeddedLanguageLimit {
+		tail := embeddedLanguageLRU.Back()
+		if tail == nil {
+			return
+		}
+		entry, ok := tail.Value.(*embeddedLanguageCacheEntry)
+		if !ok || entry == nil {
+			embeddedLanguageLRU.Remove(tail)
+			continue
+		}
+		removeEmbeddedLanguageEntryLocked(entry)
+	}
+}
+
+func evictIdleEmbeddedLanguagesLocked(now time.Time) {
+	if embeddedLanguageIdleTTL <= 0 {
+		return
+	}
+	for _, entry := range embeddedLanguageCache {
+		if entry == nil || entry.lastAccess.IsZero() {
+			continue
+		}
+		if now.Sub(entry.lastAccess) > embeddedLanguageIdleTTL {
+			removeEmbeddedLanguageEntryLocked(entry)
+		}
+	}
+}
+
+// SetEmbeddedLanguageCacheLimit sets the maximum number of decoded grammar
+// blobs retained in the in-process cache.
+//
+// - limit < 0: unlimited cache size (default)
+// - limit == 0: disable cache retention (decode on each call)
+// - limit > 0: retain at most limit most recently used grammars
+func SetEmbeddedLanguageCacheLimit(limit int) {
+	embeddedLanguageCacheMu.Lock()
+	defer embeddedLanguageCacheMu.Unlock()
+
+	if limit < 0 {
+		embeddedLanguageLimit = -1
+		return
+	}
+	embeddedLanguageLimit = limit
+	enforceEmbeddedLanguageLimitLocked()
+	evictIdleEmbeddedLanguagesLocked(time.Now())
+}
+
+// EmbeddedLanguageCacheStats returns the current decoded-grammar cache size and
+// configured cache limit.
+func EmbeddedLanguageCacheStats() (loaded int, limit int) {
+	embeddedLanguageCacheMu.Lock()
+	defer embeddedLanguageCacheMu.Unlock()
+	return len(embeddedLanguageCache), embeddedLanguageLimit
+}
+
+// UnloadEmbeddedLanguage removes one grammar blob from the decoded cache.
+// Existing parser instances that already reference the language remain valid.
+func UnloadEmbeddedLanguage(blobName string) bool {
+	embeddedLanguageCacheMu.Lock()
+	defer embeddedLanguageCacheMu.Unlock()
+
+	entry, ok := embeddedLanguageCache[blobName]
+	if !ok {
+		return false
+	}
+	removeEmbeddedLanguageEntryLocked(entry)
+	return true
+}
+
+// PurgeEmbeddedLanguageCache removes all decoded grammar blobs from cache and
+// returns the number of removed entries.
+func PurgeEmbeddedLanguageCache() int {
+	embeddedLanguageCacheMu.Lock()
+	defer embeddedLanguageCacheMu.Unlock()
+
+	count := len(embeddedLanguageCache)
+	embeddedLanguageCache = map[string]*embeddedLanguageCacheEntry{}
+	embeddedLanguageLRU.Init()
+	return count
+}
+
+// SetEmbeddedLanguageIdleTTL controls idle-time eviction for decoded grammars.
+// A value <= 0 disables idle eviction.
+func SetEmbeddedLanguageIdleTTL(ttl time.Duration) {
+	embeddedLanguageCacheMu.Lock()
+	defer embeddedLanguageCacheMu.Unlock()
+
+	embeddedLanguageIdleTTL = ttl
+	if ttl <= 0 {
+		stopEmbeddedLanguageJanitorLocked()
+		return
+	}
+	if embeddedLanguageIdleSweep <= 0 {
+		embeddedLanguageIdleSweep = 30 * time.Second
+	}
+	startEmbeddedLanguageJanitorLocked()
+	evictIdleEmbeddedLanguagesLocked(time.Now())
+}
+
+// SetEmbeddedLanguageIdleSweepInterval controls how often idle cache entries
+// are checked when idle eviction is enabled.
+func SetEmbeddedLanguageIdleSweepInterval(interval time.Duration) {
+	embeddedLanguageCacheMu.Lock()
+	defer embeddedLanguageCacheMu.Unlock()
+
+	if interval <= 0 {
+		return
+	}
+	embeddedLanguageIdleSweep = interval
+	if embeddedLanguageJanitorAlive {
+		stopEmbeddedLanguageJanitorLocked()
+		if embeddedLanguageIdleTTL > 0 {
+			startEmbeddedLanguageJanitorLocked()
+		}
+	}
+}
+
+// EmbeddedLanguageIdleConfig returns the current idle eviction settings.
+func EmbeddedLanguageIdleConfig() (ttl time.Duration, sweepInterval time.Duration) {
+	embeddedLanguageCacheMu.Lock()
+	defer embeddedLanguageCacheMu.Unlock()
+	return embeddedLanguageIdleTTL, embeddedLanguageIdleSweep
+}
+
+func startEmbeddedLanguageJanitorLocked() {
+	if embeddedLanguageJanitorAlive || embeddedLanguageIdleTTL <= 0 {
+		return
+	}
+	if embeddedLanguageIdleSweep <= 0 {
+		embeddedLanguageIdleSweep = 30 * time.Second
+	}
+	stop := make(chan struct{})
+	embeddedLanguageJanitorStop = stop
+	embeddedLanguageJanitorAlive = true
+	sweep := embeddedLanguageIdleSweep
+
+	go func() {
+		ticker := time.NewTicker(sweep)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				embeddedLanguageCacheMu.Lock()
+				evictIdleEmbeddedLanguagesLocked(time.Now())
+				embeddedLanguageCacheMu.Unlock()
+			case <-stop:
+				return
+			}
+		}
+	}()
+}
+
+func stopEmbeddedLanguageJanitorLocked() {
+	if !embeddedLanguageJanitorAlive {
+		return
+	}
+	close(embeddedLanguageJanitorStop)
+	embeddedLanguageJanitorStop = nil
+	embeddedLanguageJanitorAlive = false
+}
+
+func decodeEmbeddedLanguage(blobName string) (*gotreesitter.Language, error) {
+	blob, err := readGrammarBlob(blobName)
+	if err != nil {
+		return nil, fmt.Errorf("read grammar blob %q: %w", blobName, err)
+	}
+	defer blob.close()
+
+	gzr, err := gzip.NewReader(bytes.NewReader(blob.data))
+	if err != nil {
+		return nil, fmt.Errorf("open gzip grammar blob %q: %w", blobName, err)
+	}
+	defer gzr.Close()
+
+	dec := gob.NewDecoder(gzr)
+	var lang gotreesitter.Language
+	if err := dec.Decode(&lang); err != nil {
+		return nil, fmt.Errorf("decode grammar blob %q: %w", blobName, err)
+	}
+
+	compactDecodedLanguage(&lang)
+
+	return &lang, nil
+}

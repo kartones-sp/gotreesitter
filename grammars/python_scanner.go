@@ -4,7 +4,7 @@ import (
 	gotreesitter "github.com/odvcencio/gotreesitter"
 )
 
-// External token indexes must match python_grammar.go ExternalSymbols order.
+// External token indexes must match the generated Python grammar ExternalSymbols order.
 const (
 	pyTokNewline = iota
 	pyTokIndent
@@ -20,7 +20,7 @@ const (
 	pyTokExcept
 )
 
-// Concrete symbol IDs from grammars/python_grammar.go ExternalSymbols.
+// Concrete symbol IDs from the generated Python grammar ExternalSymbols.
 const (
 	pySymNewline             gotreesitter.Symbol = 101
 	pySymIndent              gotreesitter.Symbol = 102

@@ -139,12 +139,23 @@ func TestRunBatchManifestLocalRepo(t *testing.T) {
 	}
 
 	outDir := filepath.Join(root, "out")
-	if err := RunBatchManifest(manifest, outDir, "grammars"); err != nil {
+	if err := RunBatchManifest(manifest, outDir, "grammars", true); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := os.Stat(filepath.Join(outDir, "testlang_grammar.go")); err != nil {
-		t.Fatalf("missing generated grammar file: %v", err)
+	loaderFile := filepath.Join(outDir, "embedded_grammars_gen.go")
+	if _, err := os.Stat(loaderFile); err != nil {
+		t.Fatalf("missing generated embedded grammar loader file: %v", err)
+	}
+	loaderSrc, err := os.ReadFile(loaderFile)
+	if err != nil {
+		t.Fatalf("read generated loader: %v", err)
+	}
+	if !strings.Contains(string(loaderSrc), "func TestlangLanguage() *gotreesitter.Language") {
+		t.Fatal("generated loader missing TestlangLanguage wrapper")
+	}
+	if _, err := os.Stat(filepath.Join(outDir, "grammar_blobs", "testlang.bin")); err != nil {
+		t.Fatalf("missing generated grammar blob file: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(outDir, "testlang_register.go")); err != nil {
 		t.Fatalf("missing generated register file: %v", err)

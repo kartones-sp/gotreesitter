@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 )
 
 func main() {
@@ -16,6 +17,7 @@ func main() {
 	name := flag.String("name", "", "language name (auto-detected from parser.c if empty)")
 	manifest := flag.String("manifest", "", "batch mode: path to manifest file")
 	outdir := flag.String("outdir", "", "batch mode: output directory for generated files")
+	compact := flag.Bool("compact", true, "compact and intern repeated tables before encoding")
 	flag.Parse()
 
 	if *manifest != "" {
@@ -23,7 +25,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "batch mode requires -outdir")
 			os.Exit(1)
 		}
-		if err := RunBatchManifest(*manifest, *outdir, *pkg); err != nil {
+		if err := RunBatchManifest(*manifest, *outdir, *pkg, *compact); err != nil {
 			fmt.Fprintf(os.Stderr, "batch: %v\n", err)
 			os.Exit(1)
 		}
@@ -52,12 +54,35 @@ func main() {
 		grammar.Name = *name
 	}
 
-	code := GenerateGo(grammar, *pkg)
+	blobBase := safeFileBase(grammar.Name)
+	blobDir := filepath.Join(filepath.Dir(*output), "grammar_blobs")
+	if err := os.MkdirAll(blobDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "mkdir %s: %v\n", blobDir, err)
+		os.Exit(1)
+	}
+	blobName := blobBase + ".bin"
+	blobPath := filepath.Join(blobDir, blobName)
+
+	lang := BuildLanguage(grammar)
+	if *compact {
+		NewLanguageCompactor().CompactLanguage(lang)
+	}
+	blob, err := EncodeLanguageBlob(lang)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "encode blob: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.WriteFile(blobPath, blob, 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "write %s: %v\n", blobPath, err)
+		os.Exit(1)
+	}
+
+	code := GenerateEmbeddedGo(grammar, *pkg, blobName)
 	if err := os.WriteFile(*output, []byte(code), 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "write %s: %v\n", *output, err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("Generated %s (%s language, %d states, %d symbols)\n",
-		*output, grammar.Name, grammar.StateCount, grammar.SymbolCount)
+	fmt.Printf("Generated %s and %s (%s language, %d states, %d symbols)\n",
+		*output, blobPath, grammar.Name, grammar.StateCount, grammar.SymbolCount)
 }

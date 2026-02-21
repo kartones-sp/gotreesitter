@@ -114,15 +114,24 @@ func TestExtractJsonGrammar(t *testing.T) {
 		t.Error("SymbolMetadata[16] (_value) should be supertype")
 	}
 
-	// Generate Go code and verify it compiles (basic syntax check).
-	code := GenerateGo(g, "grammars")
+	// Generate embedded wrapper and verify it references the blob loader.
+	lang := BuildLanguage(g)
+	if lang == nil {
+		t.Fatal("BuildLanguage returned nil")
+	}
+	blob, err := EncodeLanguageBlob(lang)
+	if err != nil {
+		t.Fatalf("EncodeLanguageBlob failed: %v", err)
+	}
+	if len(blob) == 0 {
+		t.Fatal("EncodeLanguageBlob returned empty payload")
+	}
+
+	code := GenerateEmbeddedGo(g, "grammars", "json.bin")
 	if !strings.Contains(code, "func JsonLanguage()") {
 		t.Error("generated code missing JsonLanguage function")
 	}
-	if !strings.Contains(code, "SymbolCount:        25") {
-		t.Error("generated code missing correct SymbolCount")
-	}
-	if !strings.Contains(code, "StateCount:         32") {
-		t.Error("generated code missing correct StateCount")
+	if !strings.Contains(code, `loadEmbeddedLanguage("json.bin")`) {
+		t.Error("generated code missing blob loader call")
 	}
 }

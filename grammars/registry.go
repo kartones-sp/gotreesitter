@@ -20,6 +20,9 @@ var registry []LangEntry
 
 // Register adds a language to the registry.
 func Register(entry LangEntry) {
+	if !languageEnabled(entry.Name) {
+		return
+	}
 	if entry.TokenSourceFactory == nil {
 		entry.TokenSourceFactory = defaultTokenSourceFactory(entry.Name)
 	}

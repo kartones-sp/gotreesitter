@@ -587,14 +587,26 @@ func TestExtractGrammarFull(t *testing.T) {
 	}
 }
 
-func TestGenerateGo(t *testing.T) {
+func TestGenerateEmbeddedGo(t *testing.T) {
 	g, err := ExtractGrammar(miniParserC)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	g.ExternalSymbols = []uint16{5}
-	code := GenerateGo(g, "testpkg")
+	lang := BuildLanguage(g)
+	if lang == nil {
+		t.Fatal("BuildLanguage returned nil")
+	}
+	blob, err := EncodeLanguageBlob(lang)
+	if err != nil {
+		t.Fatalf("EncodeLanguageBlob failed: %v", err)
+	}
+	if len(blob) == 0 {
+		t.Fatal("EncodeLanguageBlob returned empty payload")
+	}
+
+	code := GenerateEmbeddedGo(g, "testpkg", "test_lang.bin")
 
 	// Verify the generated code contains expected strings.
 	checks := []string{
@@ -602,17 +614,7 @@ func TestGenerateGo(t *testing.T) {
 		`import "github.com/odvcencio/gotreesitter"`,
 		"func TestLangLanguage()",
 		"*gotreesitter.Language",
-		`Name: "test_lang"`,
-		"SymbolCount:        6",
-		"StateCount:         5",
-		"ParseActionShift",
-		"ParseActionAccept",
-		"ParseActionReduce",
-		"FieldMapSlices",
-		"FieldMapEntries",
-		"ExternalSymbols",
-		`"number"`,
-		`"end"`,
+		`loadEmbeddedLanguage("test_lang.bin")`,
 	}
 
 	for _, check := range checks {
