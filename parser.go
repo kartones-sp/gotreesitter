@@ -910,15 +910,28 @@ func (p *Parser) applyAction(s *glrStack, act ParseAction, tok Token, anyReduced
 
 	case ParseActionReduce:
 		childCount := int(act.ChildCount)
-		if childCount > len(s.entries)-1 {
+
+		// Find the start position by scanning backwards, counting only
+		// non-extra entries toward childCount. In tree-sitter's C runtime
+		// (ts_stack_pop_count / stack__iter), extras on the stack are
+		// skipped when counting children for a reduce action.
+		start := len(s.entries)
+		nonExtraFound := 0
+		for nonExtraFound < childCount && start > 1 {
+			start--
+			if s.entries[start].node != nil && !s.entries[start].node.isExtra {
+				nonExtraFound++
+			}
+		}
+		if nonExtraFound < childCount {
 			// Not enough stack entries — kill this stack version.
 			s.dead = true
 			return
 		}
 
-		start := len(s.entries) - childCount
+		// actualEntryCount includes extras interleaved between grammar symbols.
+		actualEntryCount := len(s.entries) - start
 		topState := s.entries[start-1].state
-		parentVisible := symbolVisible(p.language, act.Symbol)
 
 		// Preserve raw span from reduced children while excluding pure extra
 		// padding, so parent ranges match the C runtime.
@@ -927,8 +940,8 @@ func (p *Parser) applyAction(s *glrStack, act ParseAction, tok Token, anyReduced
 		var rawStartPoint, rawEndPoint Point
 		rawHasStart := false
 		rawHasEnd := false
-		if childCount > 0 {
-			for i := 0; i < childCount; i++ {
+		if actualEntryCount > 0 {
+			for i := 0; i < actualEntryCount; i++ {
 				if b, pt, ok := spanStartExcludingExtra(p.language, s.entries[start+i].node); ok {
 					rawStartByte = b
 					rawStartPoint = pt
@@ -936,10 +949,10 @@ func (p *Parser) applyAction(s *glrStack, act ParseAction, tok Token, anyReduced
 					break
 				}
 			}
-			for i := childCount - 1; i >= 0; i-- {
-				// Kotlin inserts hidden automatic-semicolon wrappers that should
-				// not extend visible parent ranges.
-				excludeHidden := !parentVisible || p.language.Name == "kotlin"
+			for i := actualEntryCount - 1; i >= 0; i-- {
+				// Hidden (anonymous, non-visible) leaf nodes should not extend
+				// visible parent ranges — e.g. automatic-semicolon wrappers.
+				excludeHidden := true
 				if b, pt, ok := spanEndExcludingExtra(p.language, s.entries[start+i].node, excludeHidden); ok {
 					rawEndByte = b
 					rawEndPoint = pt
@@ -948,7 +961,7 @@ func (p *Parser) applyAction(s *glrStack, act ParseAction, tok Token, anyReduced
 				}
 			}
 			firstRaw := s.entries[start].node
-			lastRaw := s.entries[start+childCount-1].node
+			lastRaw := s.entries[start+actualEntryCount-1].node
 			if !rawHasStart && firstRaw != nil {
 				rawStartByte = firstRaw.startByte
 				rawStartPoint = firstRaw.startPoint
@@ -963,7 +976,7 @@ func (p *Parser) applyAction(s *glrStack, act ParseAction, tok Token, anyReduced
 		// storage and avoid per-reduce heap allocations.
 		normalizedCount := 0
 		structuralChildIndex := 0
-		for i := 0; i < childCount; i++ {
+		for i := 0; i < actualEntryCount; i++ {
 			n := s.entries[start+i].node
 			effectiveSymbol := n.symbol
 			if !n.isExtra {
@@ -996,13 +1009,13 @@ func (p *Parser) applyAction(s *glrStack, act ParseAction, tok Token, anyReduced
 
 		out := 0
 		structuralChildIndex = 0
-		for i := 0; i < childCount; i++ {
+		for i := 0; i < actualEntryCount; i++ {
 			n := s.entries[start+i].node
 			var fid FieldID
-			if i < len(rawFieldIDs) {
-				fid = rawFieldIDs[i]
-			}
 			if !n.isExtra {
+				if structuralChildIndex < len(rawFieldIDs) {
+					fid = rawFieldIDs[structuralChildIndex]
+				}
 				if alias := p.aliasSymbolForChild(act.ProductionID, structuralChildIndex); alias != 0 {
 					n = aliasedNodeInArena(arena, p.language, n, alias)
 				}
@@ -1035,7 +1048,7 @@ func (p *Parser) applyAction(s *glrStack, act ParseAction, tok Token, anyReduced
 
 		named := p.isNamedSymbol(act.Symbol)
 		parent := newParentNodeInArena(arena, act.Symbol, named, children, fieldIDs, act.ProductionID)
-		if childCount > 0 {
+		if actualEntryCount > 0 {
 			parent.startByte = rawStartByte
 			parent.endByte = rawEndByte
 			parent.startPoint = rawStartPoint

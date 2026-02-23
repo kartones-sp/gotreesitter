@@ -509,9 +509,15 @@ func TestParsePredicateAnyOf(t *testing.T) {
 
 func TestParsePredicateUnknownCapture(t *testing.T) {
 	lang := queryTestLanguage()
-	_, err := NewQuery(`(identifier) @name (#eq? @missing "main")`, lang)
-	if err == nil {
-		t.Fatal("expected error for unknown predicate capture")
+	q, err := NewQuery(`(identifier) @name (#eq? @missing "main")`, lang)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	tree := buildSimpleTree(lang)
+	matches := q.Execute(tree)
+	if len(matches) != 0 {
+		t.Fatalf("matches: got %d, want 0 (missing predicate capture should not match)", len(matches))
 	}
 }
 
@@ -528,6 +534,102 @@ func TestParsePredicateAnyOfRejectsCaptureArg(t *testing.T) {
 	_, err := NewQuery(`(identifier) @a (identifier) @b (#any-of? @a @b)`, lang)
 	if err == nil {
 		t.Fatal("expected error for capture argument in #any-of?")
+	}
+}
+
+func TestParseParenthesizedStringPattern(t *testing.T) {
+	lang := queryTestLanguage()
+	q, err := NewQuery(`("(") @punctuation.bracket`, lang)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if q.PatternCount() != 1 {
+		t.Fatalf("PatternCount: got %d, want 1", q.PatternCount())
+	}
+	step := q.patterns[0].steps[0]
+	if step.textMatch != "(" {
+		t.Fatalf("textMatch: got %q, want %q", step.textMatch, "(")
+	}
+}
+
+func TestParseGroupWrapperWithDirectivePredicate(t *testing.T) {
+	lang := queryTestLanguage()
+	q, err := NewQuery(`((identifier) @name (#set! "priority" 100))`, lang)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if q.PatternCount() != 1 {
+		t.Fatalf("PatternCount: got %d, want 1", q.PatternCount())
+	}
+	if len(q.patterns[0].predicates) != 1 {
+		t.Fatalf("predicates: got %d, want 1", len(q.patterns[0].predicates))
+	}
+	if q.patterns[0].predicates[0].kind != predicateNoop {
+		t.Fatalf("predicate kind: got %d, want %d", q.patterns[0].predicates[0].kind, predicateNoop)
+	}
+}
+
+func TestParseTopLevelFieldShorthand(t *testing.T) {
+	lang := queryTestLanguage()
+	q, err := NewQuery(`name: (identifier) @name`, lang)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if q.PatternCount() != 1 {
+		t.Fatalf("PatternCount: got %d, want 1", q.PatternCount())
+	}
+	steps := q.patterns[0].steps
+	if len(steps) != 2 {
+		t.Fatalf("steps: got %d, want 2", len(steps))
+	}
+	if steps[1].field != FieldID(1) {
+		t.Fatalf("field: got %d, want 1", steps[1].field)
+	}
+}
+
+func TestParseFieldWildcardShorthand(t *testing.T) {
+	lang := queryTestLanguage()
+	q, err := NewQuery(`(call_expression function: _ @fn)`, lang)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if q.PatternCount() != 1 {
+		t.Fatalf("PatternCount: got %d, want 1", q.PatternCount())
+	}
+	steps := q.patterns[0].steps
+	if len(steps) != 2 {
+		t.Fatalf("steps: got %d, want 2", len(steps))
+	}
+	if steps[1].symbol != 0 {
+		t.Fatalf("symbol: got %d, want wildcard 0", steps[1].symbol)
+	}
+	if steps[1].captureID < 0 {
+		t.Fatal("captureID: expected capture on wildcard child")
+	}
+}
+
+func TestParseAlternationBranchCaptures(t *testing.T) {
+	lang := queryTestLanguage()
+	q, err := NewQuery(`[(identifier) @name (number) @name]`, lang)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if q.PatternCount() != 1 {
+		t.Fatalf("PatternCount: got %d, want 1", q.PatternCount())
+	}
+	step := q.patterns[0].steps[0]
+	if len(step.alternatives) != 2 {
+		t.Fatalf("alternatives: got %d, want 2", len(step.alternatives))
+	}
+	if step.alternatives[0].captureID < 0 || step.alternatives[1].captureID < 0 {
+		t.Fatal("expected capture IDs on alternation branches")
+	}
+}
+
+func TestParseErrorPseudoNodeAllowed(t *testing.T) {
+	lang := queryTestLanguage()
+	if _, err := NewQuery(`(ERROR) @error`, lang); err != nil {
+		t.Fatalf("parse error: %v", err)
 	}
 }
 

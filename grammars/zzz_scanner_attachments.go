@@ -11,8 +11,8 @@ import "github.com/odvcencio/gotreesitter"
 // future batch runs.
 //
 // init() order within a Go package is alphabetical by filename.
-// All *_register.go files for the languages below sort before "s",
-// so the registry entries already exist when this init runs.
+// This file starts with "zzz_" to ensure it runs AFTER all
+// *_register.go files, so registry entries exist when this init runs.
 
 func init() {
 	attachments := map[string]gotreesitter.ExternalScanner{
@@ -23,6 +23,11 @@ func init() {
 		"foam":    FoamExternalScanner{},
 		"nginx":   NginxExternalScanner{},
 		"nushell": NushellExternalScanner{},
+		"r":       RExternalScanner{},
+		"xml":        XMLExternalScanner{},
+		"yuck":       YuckExternalScanner{},
+		"purescript": PurescriptExternalScanner{},
+		"typst":      TypstExternalScanner{},
 	}
 
 	for i := range registry {

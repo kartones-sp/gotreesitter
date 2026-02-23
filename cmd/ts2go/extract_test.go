@@ -339,6 +339,29 @@ func TestExtractFieldMaps(t *testing.T) {
 	}
 }
 
+func TestExtractFieldMapsModernName(t *testing.T) {
+	// Modern tree-sitter generators use "ts_field_map_entries" instead of "ts_field_map".
+	modernSource := strings.Replace(miniParserC, "ts_field_map[]", "ts_field_map_entries[]", 1)
+
+	g := miniGrammar()
+	g.ProductionIDCount = 2
+	g.FieldCount = 2
+
+	if err := extractFieldMaps(modernSource, g); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(g.FieldMapEntries) != 2 {
+		t.Fatalf("len(FieldMapEntries) = %d, want 2", len(g.FieldMapEntries))
+	}
+	if g.FieldMapEntries[0].FieldID != 1 {
+		t.Errorf("FieldMapEntries[0].FieldID = %d, want 1", g.FieldMapEntries[0].FieldID)
+	}
+	if g.FieldMapEntries[1].FieldID != 2 {
+		t.Errorf("FieldMapEntries[1].FieldID = %d, want 2", g.FieldMapEntries[1].FieldID)
+	}
+}
+
 func TestExtractParseTable(t *testing.T) {
 	g := miniGrammar()
 	g.LargeStateCount = 2

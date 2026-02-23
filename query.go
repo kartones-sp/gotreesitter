@@ -56,6 +56,7 @@ const (
 	predicateNotEq
 	predicateMatch
 	predicateAnyOf
+	predicateNoop
 )
 
 // QueryPredicate is a post-match constraint attached to a pattern.
@@ -82,6 +83,8 @@ type alternativeSymbol struct {
 	isNamed bool
 	// textMatch for string alternatives like "func"
 	textMatch string
+	// captureID for alternation items like [(identifier) @name ...].
+	captureID int
 }
 
 // QueryMatch represents a successful pattern match with its captures.
@@ -407,6 +410,10 @@ func (q *Query) matchesPredicates(predicates []QueryPredicate, captures []QueryC
 	}
 
 	for _, pred := range predicates {
+		if pred.kind == predicateNoop {
+			continue
+		}
+
 		left, ok := captureText(pred.leftCapture, captures, source)
 		if !ok {
 			return false
@@ -455,6 +462,10 @@ func (q *Query) matchesPredicates(predicates []QueryPredicate, captures []QueryC
 			if !matched {
 				return false
 			}
+		case predicateNoop:
+			// Metadata predicates/directives (for example #set!, #is?) are
+			// accepted for compatibility but do not affect match results.
+			continue
 		}
 	}
 
@@ -487,10 +498,11 @@ func (q *Query) matchSteps(steps []QueryStep, stepIdx int, node *Node, lang *Lan
 		return false
 	}
 
-	// Collect capture if present.
-	if step.captureID >= 0 {
+	// Collect captures for this step. Alternation items may carry their own
+	// capture names.
+	for _, captureID := range q.captureIDsForStep(step, node, lang) {
 		*captures = append(*captures, QueryCapture{
-			Name: q.captures[step.captureID],
+			Name: q.captures[captureID],
 			Node: node,
 		})
 	}
@@ -590,17 +602,7 @@ func (q *Query) nodeMatchesStep(step *QueryStep, node *Node, lang *Language) boo
 	// Alternation matching.
 	if len(step.alternatives) > 0 {
 		for _, alt := range step.alternatives {
-			// Wildcard in alternation `( _ )` should match any node.
-			if alt.symbol == 0 && alt.textMatch == "" {
-				return true
-			}
-
-			if alt.textMatch != "" {
-				// String match for anonymous nodes.
-				if !node.IsNamed() && node.Type(lang) == alt.textMatch {
-					return true
-				}
-			} else if node.Symbol() == alt.symbol && node.IsNamed() == alt.isNamed {
+			if alternativeMatchesNode(alt, node, lang) {
 				return true
 			}
 		}
@@ -628,6 +630,55 @@ func (q *Query) nodeMatchesStep(step *QueryStep, node *Node, lang *Language) boo
 	}
 
 	return true
+}
+
+func (q *Query) captureIDsForStep(step *QueryStep, node *Node, lang *Language) []int {
+	if len(step.alternatives) == 0 {
+		if step.captureID >= 0 {
+			return []int{step.captureID}
+		}
+		return nil
+	}
+
+	var ids []int
+	if step.captureID >= 0 {
+		ids = append(ids, step.captureID)
+	}
+
+	for _, alt := range step.alternatives {
+		if !alternativeMatchesNode(alt, node, lang) {
+			continue
+		}
+		if alt.captureID >= 0 {
+			dup := false
+			for _, id := range ids {
+				if id == alt.captureID {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				ids = append(ids, alt.captureID)
+			}
+		}
+		break
+	}
+
+	return ids
+}
+
+func alternativeMatchesNode(alt alternativeSymbol, node *Node, lang *Language) bool {
+	// Wildcard in alternation `( _ )` should match any node.
+	if alt.symbol == 0 && alt.textMatch == "" {
+		return true
+	}
+
+	if alt.textMatch != "" {
+		// String match for anonymous nodes.
+		return !node.IsNamed() && node.Type(lang) == alt.textMatch
+	}
+
+	return node.Symbol() == alt.symbol && node.IsNamed() == alt.isNamed
 }
 
 // PatternCount returns the number of patterns in the query.
@@ -702,6 +753,19 @@ func (p *queryParser) parse() error {
 			}
 			p.q.patterns = append(p.q.patterns, *pat)
 
+		case isIdentStart(ch):
+			// Top-level field shorthand: field: (pattern)
+			pat, err := p.parseFieldShorthandPattern(0)
+			if err != nil {
+				return err
+			}
+			p.q.patterns = append(p.q.patterns, *pat)
+
+		case ch == '.':
+			// Anchor operators are currently parsed for compatibility and ignored.
+			p.pos++
+			continue
+
 		default:
 			return fmt.Errorf("query: unexpected character %q at position %d", string(ch), p.pos)
 		}
@@ -719,27 +783,64 @@ func (p *queryParser) parsePattern(depth int) (*Pattern, error) {
 	p.skipWhitespaceAndComments()
 
 	pat := &Pattern{}
-
-	// Read the node type name.
-	nodeType, err := p.readIdentifier()
-	if err != nil {
-		return nil, fmt.Errorf("query: expected node type after '(' at position %d: %w", p.pos, err)
+	if p.pos >= len(p.input) {
+		return nil, fmt.Errorf("query: unexpected end of input, expected node type or pattern")
 	}
 
-	sym, isNamed, err := p.resolveSymbol(nodeType)
-	if err != nil {
-		return nil, err
-	}
+	rootIdx := -1
 
-	step := QueryStep{
-		symbol:    sym,
-		isNamed:   isNamed,
-		captureID: -1,
-		depth:     depth,
-	}
+	// Parse the root element. This supports:
+	//   - standard node patterns: (identifier ...)
+	//   - parenthesized strings: ("(") @punctuation.bracket
+	//   - grouping wrappers: ((identifier) ... (#set! ...))
+	switch ch := p.input[p.pos]; {
+	case isIdentStart(ch):
+		nodeType, err := p.readIdentifier()
+		if err != nil {
+			return nil, fmt.Errorf("query: expected node type after '(' at position %d: %w", p.pos, err)
+		}
 
-	pat.steps = append(pat.steps, step)
-	rootIdx := len(pat.steps) - 1
+		sym, isNamed, err := p.resolveSymbol(nodeType)
+		if err != nil {
+			return nil, err
+		}
+
+		step := QueryStep{
+			symbol:    sym,
+			isNamed:   isNamed,
+			captureID: -1,
+			depth:     depth,
+		}
+		pat.steps = append(pat.steps, step)
+		rootIdx = 0
+
+	case ch == '"':
+		text, err := p.readString()
+		if err != nil {
+			return nil, err
+		}
+		pat.steps = append(pat.steps, QueryStep{
+			captureID: -1,
+			depth:     depth,
+			textMatch: text,
+		})
+		rootIdx = 0
+
+	case ch == '(' || ch == '[':
+		innerPat, err := p.parsePatternElement(depth)
+		if err != nil {
+			return nil, err
+		}
+		if len(innerPat.steps) == 0 {
+			return nil, fmt.Errorf("query: empty grouped pattern at position %d", p.pos)
+		}
+		pat.steps = append(pat.steps, innerPat.steps...)
+		pat.predicates = append(pat.predicates, innerPat.predicates...)
+		rootIdx = 0
+
+	default:
+		return nil, fmt.Errorf("query: expected node type after '(' at position %d: query: expected identifier at position %d", p.pos, p.pos)
+	}
 
 	// Parse children, fields, and captures until ')'.
 	for {
@@ -755,6 +856,23 @@ func (p *queryParser) parsePattern(depth int) (*Pattern, error) {
 			break
 		}
 
+		if ch == '.' {
+			// Anchor operators are currently parsed for compatibility and ignored.
+			p.pos++
+			continue
+		}
+
+		if ch == '!' {
+			// Field-negation constraints like !type_parameters are accepted for
+			// compatibility. They are currently not enforced at match time.
+			p.pos++
+			p.skipWhitespaceAndComments()
+			if _, err := p.readIdentifier(); err != nil {
+				return nil, err
+			}
+			continue
+		}
+
 		if ch == '@' {
 			// Capture for the current node.
 			capName, err := p.readCapture()
@@ -762,7 +880,9 @@ func (p *queryParser) parsePattern(depth int) (*Pattern, error) {
 				return nil, err
 			}
 			capID := p.ensureCapture(capName)
-			pat.steps[rootIdx].captureID = capID
+			if rootIdx >= 0 && rootIdx < len(pat.steps) {
+				pat.steps[rootIdx].captureID = capID
+			}
 			continue
 		}
 
@@ -778,41 +898,44 @@ func (p *queryParser) parsePattern(depth int) (*Pattern, error) {
 			}
 
 			// Nested pattern (child constraint).
-			childPat, err := p.parsePattern(depth + 1)
+			childPat, err := p.parsePatternElement(depth + 1)
 			if err != nil {
 				return nil, err
 			}
+			pat.predicates = append(pat.predicates, childPat.predicates...)
 			pat.steps = append(pat.steps, childPat.steps...)
 			continue
 		}
 
 		if ch == '[' {
 			// Alternation child.
-			childPat, err := p.parseAlternationPattern(depth + 1)
+			childPat, err := p.parsePatternElement(depth + 1)
 			if err != nil {
 				return nil, err
 			}
+			pat.predicates = append(pat.predicates, childPat.predicates...)
 			pat.steps = append(pat.steps, childPat.steps...)
 			continue
 		}
 
 		if ch == '"' {
 			// String child.
-			childPat, err := p.parseStringPattern(depth + 1)
+			childPat, err := p.parsePatternElement(depth + 1)
 			if err != nil {
 				return nil, err
 			}
+			pat.predicates = append(pat.predicates, childPat.predicates...)
 			pat.steps = append(pat.steps, childPat.steps...)
 			continue
 		}
 
 		// Check for field: syntax (identifier followed by ':')
 		if isIdentStart(ch) {
-			saved := p.pos
 			ident, err := p.readIdentifier()
 			if err != nil {
 				return nil, err
 			}
+			afterIdent := p.pos
 			p.skipWhitespaceAndComments()
 			if p.pos < len(p.input) && p.input[p.pos] == ':' {
 				// It's a field constraint.
@@ -829,40 +952,23 @@ func (p *queryParser) parsePattern(depth int) (*Pattern, error) {
 					return nil, fmt.Errorf("query: expected child pattern after field %q", ident)
 				}
 
-				var childSteps []QueryStep
-				ch2 := p.input[p.pos]
-				if ch2 == '(' {
-					childPat, err := p.parsePattern(depth + 1)
-					if err != nil {
-						return nil, err
-					}
-					childSteps = childPat.steps
-				} else if ch2 == '[' {
-					childPat, err := p.parseAlternationPattern(depth + 1)
-					if err != nil {
-						return nil, err
-					}
-					childSteps = childPat.steps
-				} else if ch2 == '"' {
-					childPat, err := p.parseStringPattern(depth + 1)
-					if err != nil {
-						return nil, err
-					}
-					childSteps = childPat.steps
-				} else {
-					return nil, fmt.Errorf("query: expected '(' or '[' or '\"' after field %q:", ident)
+				childPat, err := p.parsePatternElement(depth + 1)
+				if err != nil {
+					return nil, err
 				}
-
-				// Set the field on the first child step.
-				if len(childSteps) > 0 {
-					childSteps[0].field = fieldID
+				if len(childPat.steps) > 0 {
+					childPat.steps[0].field = fieldID
 				}
-				pat.steps = append(pat.steps, childSteps...)
+				pat.predicates = append(pat.predicates, childPat.predicates...)
+				pat.steps = append(pat.steps, childPat.steps...)
 			} else {
-				// Not a field, rewind. It might be part of a capture
-				// we haven't handled or some other unexpected token.
-				p.pos = saved
-				return nil, fmt.Errorf("query: unexpected identifier %q at position %d", ident, saved)
+				// Bare shorthand child pattern like `_` or `identifier`.
+				p.pos = afterIdent
+				childPat, err := p.parseIdentifierPatternFromName(depth+1, ident)
+				if err != nil {
+					return nil, err
+				}
+				pat.steps = append(pat.steps, childPat.steps...)
 			}
 			continue
 		}
@@ -873,16 +979,21 @@ func (p *queryParser) parsePattern(depth int) (*Pattern, error) {
 	// Check for capture after the closing paren.
 	p.skipWhitespaceAndComments()
 	if quantifier, ok := p.readStepQuantifier(); ok {
-		pat.steps[rootIdx].quantifier = quantifier
+		if rootIdx >= 0 && rootIdx < len(pat.steps) {
+			pat.steps[rootIdx].quantifier = quantifier
+		}
 		p.skipWhitespaceAndComments()
 	}
-	if p.pos < len(p.input) && p.input[p.pos] == '@' {
+	for p.pos < len(p.input) && p.input[p.pos] == '@' {
 		capName, err := p.readCapture()
 		if err != nil {
 			return nil, err
 		}
 		capID := p.ensureCapture(capName)
-		pat.steps[rootIdx].captureID = capID
+		if rootIdx >= 0 && rootIdx < len(pat.steps) {
+			pat.steps[rootIdx].captureID = capID
+		}
+		p.skipWhitespaceAndComments()
 	}
 
 	if err := p.validatePatternPredicates(pat); err != nil {
@@ -913,35 +1024,49 @@ func (p *queryParser) parseAlternationPattern(depth int) (*Pattern, error) {
 			break
 		}
 
-		if p.input[p.pos] == '(' {
-			// (node_type)
-			p.pos++ // consume '('
-			p.skipWhitespaceAndComments()
-			nodeType, err := p.readIdentifier()
-			if err != nil {
-				return nil, fmt.Errorf("query: expected node type in alternation: %w", err)
-			}
-			p.skipWhitespaceAndComments()
-			if p.pos >= len(p.input) || p.input[p.pos] != ')' {
-				return nil, fmt.Errorf("query: expected ')' in alternation at position %d", p.pos)
-			}
-			p.pos++ // consume ')'
-
-			sym, isNamed, err := p.resolveSymbol(nodeType)
-			if err != nil {
-				return nil, err
-			}
-			alts = append(alts, alternativeSymbol{symbol: sym, isNamed: isNamed})
-		} else if p.input[p.pos] == '"' {
-			// "string"
-			text, err := p.readString()
-			if err != nil {
-				return nil, err
-			}
-			alts = append(alts, alternativeSymbol{textMatch: text})
-		} else {
-			return nil, fmt.Errorf("query: unexpected character %q in alternation at position %d", string(p.input[p.pos]), p.pos)
+		ch := p.input[p.pos]
+		if ch == '.' {
+			// Anchors inside alternations are parsed for compatibility and ignored.
+			p.pos++
+			continue
 		}
+
+		var branchPat *Pattern
+		var err error
+		if ch == '(' || ch == '[' || ch == '"' {
+			branchPat, err = p.parsePatternElement(depth)
+		} else if isIdentStart(ch) {
+			// Alternation may contain field shorthand branches like:
+			// [name: (identifier) alias: (identifier)].
+			ident, readErr := p.readIdentifier()
+			if readErr != nil {
+				return nil, readErr
+			}
+			p.skipWhitespaceAndComments()
+			if p.pos < len(p.input) && p.input[p.pos] == ':' {
+				p.pos++ // consume ':'
+				p.skipWhitespaceAndComments()
+				branchPat, err = p.parsePatternElement(depth)
+			} else {
+				branchPat, err = p.parseIdentifierPatternFromName(depth, ident)
+			}
+		} else {
+			return nil, fmt.Errorf("query: unexpected character %q in alternation at position %d", string(ch), p.pos)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if len(branchPat.steps) == 0 {
+			continue
+		}
+
+		root := branchPat.steps[0]
+		alts = append(alts, alternativeSymbol{
+			symbol:    root.symbol,
+			isNamed:   root.isNamed,
+			textMatch: root.textMatch,
+			captureID: root.captureID,
+		})
 	}
 
 	if len(alts) == 0 {
@@ -960,12 +1085,13 @@ func (p *queryParser) parseAlternationPattern(depth int) (*Pattern, error) {
 		step.quantifier = quantifier
 		p.skipWhitespaceAndComments()
 	}
-	if p.pos < len(p.input) && p.input[p.pos] == '@' {
+	for p.pos < len(p.input) && p.input[p.pos] == '@' {
 		capName, err := p.readCapture()
 		if err != nil {
 			return nil, err
 		}
 		step.captureID = p.ensureCapture(capName)
+		p.skipWhitespaceAndComments()
 	}
 
 	return &Pattern{steps: []QueryStep{step}}, nil
@@ -990,15 +1116,114 @@ func (p *queryParser) parseStringPattern(depth int) (*Pattern, error) {
 		step.quantifier = quantifier
 		p.skipWhitespaceAndComments()
 	}
-	if p.pos < len(p.input) && p.input[p.pos] == '@' {
+	for p.pos < len(p.input) && p.input[p.pos] == '@' {
 		capName, err := p.readCapture()
 		if err != nil {
 			return nil, err
 		}
 		step.captureID = p.ensureCapture(capName)
+		p.skipWhitespaceAndComments()
 	}
 
 	return &Pattern{steps: []QueryStep{step}}, nil
+}
+
+// parsePatternElement parses one query element at the given depth.
+// Supported forms:
+//   - (pattern ...)
+//   - [alternation ...]
+//   - "string"
+//   - identifier / _ (shorthand single-node pattern)
+func (p *queryParser) parsePatternElement(depth int) (*Pattern, error) {
+	if p.pos >= len(p.input) {
+		return nil, fmt.Errorf("query: expected pattern element at end of input")
+	}
+
+	switch ch := p.input[p.pos]; {
+	case ch == '(':
+		return p.parsePattern(depth)
+	case ch == '[':
+		return p.parseAlternationPattern(depth)
+	case ch == '"':
+		return p.parseStringPattern(depth)
+	case isIdentStart(ch):
+		name, err := p.readIdentifier()
+		if err != nil {
+			return nil, err
+		}
+		return p.parseIdentifierPatternFromName(depth, name)
+	default:
+		return nil, fmt.Errorf("query: expected '(' or '[' or '\"' or identifier at position %d", p.pos)
+	}
+}
+
+func (p *queryParser) parseIdentifierPatternFromName(depth int, name string) (*Pattern, error) {
+	sym, isNamed, err := p.resolveSymbol(name)
+	if err != nil {
+		return nil, err
+	}
+
+	step := QueryStep{
+		symbol:    sym,
+		isNamed:   isNamed,
+		captureID: -1,
+		depth:     depth,
+	}
+
+	p.skipWhitespaceAndComments()
+	if quantifier, ok := p.readStepQuantifier(); ok {
+		step.quantifier = quantifier
+		p.skipWhitespaceAndComments()
+	}
+	for p.pos < len(p.input) && p.input[p.pos] == '@' {
+		capName, err := p.readCapture()
+		if err != nil {
+			return nil, err
+		}
+		step.captureID = p.ensureCapture(capName)
+		p.skipWhitespaceAndComments()
+	}
+
+	return &Pattern{steps: []QueryStep{step}}, nil
+}
+
+func (p *queryParser) parseFieldShorthandPattern(depth int) (*Pattern, error) {
+	fieldName, err := p.readIdentifier()
+	if err != nil {
+		return nil, err
+	}
+	p.skipWhitespaceAndComments()
+	if p.pos >= len(p.input) || p.input[p.pos] != ':' {
+		return nil, fmt.Errorf("query: unexpected identifier %q at position %d", fieldName, p.pos)
+	}
+	p.pos++ // consume ':'
+	p.skipWhitespaceAndComments()
+
+	fieldID, err := p.resolveField(fieldName)
+	if err != nil {
+		return nil, err
+	}
+
+	childPat, err := p.parsePatternElement(depth + 1)
+	if err != nil {
+		return nil, err
+	}
+	if len(childPat.steps) > 0 {
+		childPat.steps[0].field = fieldID
+	}
+
+	// Use a wildcard root so field constraints can still be represented in the
+	// existing matcher shape.
+	root := QueryStep{
+		symbol:    0,
+		isNamed:   false,
+		captureID: -1,
+		depth:     depth,
+	}
+	pat := &Pattern{steps: []QueryStep{root}}
+	pat.steps = append(pat.steps, childPat.steps...)
+	pat.predicates = append(pat.predicates, childPat.predicates...)
+	return pat, nil
 }
 
 func (p *queryParser) parsePredicate() (QueryPredicate, error) {
@@ -1011,6 +1236,18 @@ func (p *queryParser) parsePredicate() (QueryPredicate, error) {
 	name, err := p.readPredicateName()
 	if err != nil {
 		return QueryPredicate{}, err
+	}
+
+	switch name {
+	case "#eq?", "#not-eq?", "#match?", "#any-of?":
+		// Handled below.
+	default:
+		// Accept unknown predicates/directives for compatibility and treat them
+		// as no-ops.
+		if err := p.consumeUnknownPredicateBody(); err != nil {
+			return QueryPredicate{}, err
+		}
+		return QueryPredicate{kind: predicateNoop}, nil
 	}
 
 	p.skipWhitespaceAndComments()
@@ -1128,29 +1365,39 @@ func (p *queryParser) parsePredicate() (QueryPredicate, error) {
 	}
 }
 
+func (p *queryParser) consumeUnknownPredicateBody() error {
+	depth := 1 // currently inside "(#... "
+	for p.pos < len(p.input) {
+		ch := p.input[p.pos]
+		switch ch {
+		case '"':
+			if _, err := p.readString(); err != nil {
+				return err
+			}
+			continue
+		case '(':
+			depth++
+			p.pos++
+		case ')':
+			depth--
+			p.pos++
+			if depth == 0 {
+				return nil
+			}
+		default:
+			p.pos++
+		}
+	}
+	return fmt.Errorf("query: expected ')' to close predicate at position %d", p.pos)
+}
+
 func (p *queryParser) validatePatternPredicates(pat *Pattern) error {
 	if len(pat.predicates) == 0 {
 		return nil
 	}
-
-	captureSet := make(map[string]struct{})
-	for _, s := range pat.steps {
-		if s.captureID >= 0 && s.captureID < len(p.q.captures) {
-			captureSet[p.q.captures[s.captureID]] = struct{}{}
-		}
-	}
-
-	for _, pred := range pat.predicates {
-		if _, ok := captureSet[pred.leftCapture]; !ok {
-			return fmt.Errorf("query: predicate references unknown capture @%s", pred.leftCapture)
-		}
-		if pred.rightCapture != "" {
-			if _, ok := captureSet[pred.rightCapture]; !ok {
-				return fmt.Errorf("query: predicate references unknown capture @%s", pred.rightCapture)
-			}
-		}
-	}
-
+	// Keep predicate validation permissive for compatibility with upstream
+	// highlight queries. Runtime predicate evaluation will naturally reject
+	// matches when a required capture is missing.
 	return nil
 }
 
@@ -1220,7 +1467,7 @@ func (p *queryParser) readIdentifier() (string, error) {
 	start := p.pos
 	for p.pos < len(p.input) {
 		ch := rune(p.input[p.pos])
-		if unicode.IsLetter(ch) || unicode.IsDigit(ch) || ch == '_' || ch == '.' || ch == '-' {
+		if unicode.IsLetter(ch) || unicode.IsDigit(ch) || ch == '_' || ch == '.' || ch == '-' || ch == '/' {
 			p.pos++
 		} else {
 			break
@@ -1296,8 +1543,24 @@ func (p *queryParser) resolveSymbol(name string) (Symbol, bool, error) {
 	if name == "_" {
 		return 0, false, nil
 	}
+	if name == "ERROR" {
+		return errorSymbol, true, nil
+	}
+	if name == "MISSING" {
+		return 0, false, nil
+	}
 
 	sym, ok := p.lang.SymbolByName(name)
+	if !ok {
+		// Some highlight queries use supertype-like names such as
+		// "pattern/wildcard". Fall back to the rightmost segment when needed.
+		if idx := strings.LastIndex(name, "/"); idx >= 0 && idx+1 < len(name) {
+			if fallback, fallbackOK := p.lang.SymbolByName(name[idx+1:]); fallbackOK {
+				sym = fallback
+				ok = true
+			}
+		}
+	}
 	if !ok {
 		return 0, false, fmt.Errorf("query: unknown node type %q", name)
 	}

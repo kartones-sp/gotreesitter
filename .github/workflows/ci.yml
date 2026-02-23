@@ -14,17 +14,14 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Build Core Module
-        run: go build .
+      - name: Build
+        run: go build ./...
 
-      - name: Build ts2go
-        run: go build ./cmd/ts2go
+      - name: Vet
+        run: go vet ./...
 
-      - name: Build Grammars (External Blob Mode)
-        run: go build -tags grammar_blobs_external ./grammars
-
-      - name: Build Parity Report (External Blob Mode)
-        run: go build -tags grammar_blobs_external ./cmd/parity_report
+      - name: Test
+        run: go test ./... -race -count=1
 
       - name: Run Parity Report (External Blob Mode)
         run: |

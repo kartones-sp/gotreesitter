@@ -6,6 +6,27 @@ import (
 	"github.com/odvcencio/gotreesitter"
 )
 
+// ParseQuality summarizes how trustworthy a grammar's parse output is.
+type ParseQuality string
+
+const (
+	ParseQualityFull    ParseQuality = "full"    // token_source or dfa with scanner
+	ParseQualityPartial ParseQuality = "partial" // dfa-partial (missing ext scanner)
+	ParseQualityNone    ParseQuality = "none"    // cannot parse
+)
+
+// qualityFromBackend maps a ParseBackend to a ParseQuality.
+func qualityFromBackend(b ParseBackend) ParseQuality {
+	switch b {
+	case ParseBackendTokenSource, ParseBackendDFA:
+		return ParseQualityFull
+	case ParseBackendDFAPartial:
+		return ParseQualityPartial
+	default:
+		return ParseQualityNone
+	}
+}
+
 // ParseBackend describes how a language can be parsed in this runtime.
 type ParseBackend string
 
@@ -139,6 +160,38 @@ func defaultTokenSourceFactory(name string) func(src []byte, lang *gotreesitter.
 			return NewGenericTokenSourceOrEOF(src, lang)
 		}
 	case "hcl":
+		return func(src []byte, lang *gotreesitter.Language) gotreesitter.TokenSource {
+			return NewGenericTokenSourceOrEOF(src, lang)
+		}
+	case "rescript":
+		return func(src []byte, lang *gotreesitter.Language) gotreesitter.TokenSource {
+			return NewGenericTokenSourceOrEOF(src, lang)
+		}
+	case "swift":
+		return func(src []byte, lang *gotreesitter.Language) gotreesitter.TokenSource {
+			return NewGenericTokenSourceOrEOF(src, lang)
+		}
+	case "vhdl":
+		return func(src []byte, lang *gotreesitter.Language) gotreesitter.TokenSource {
+			return NewGenericTokenSourceOrEOF(src, lang)
+		}
+	case "comment":
+		return func(src []byte, lang *gotreesitter.Language) gotreesitter.TokenSource {
+			return NewGenericTokenSourceOrEOF(src, lang)
+		}
+	case "nginx":
+		return func(src []byte, lang *gotreesitter.Language) gotreesitter.TokenSource {
+			return NewGenericTokenSourceOrEOF(src, lang)
+		}
+	case "rst":
+		return func(src []byte, lang *gotreesitter.Language) gotreesitter.TokenSource {
+			return NewGenericTokenSourceOrEOF(src, lang)
+		}
+	case "svelte":
+		return func(src []byte, lang *gotreesitter.Language) gotreesitter.TokenSource {
+			return NewGenericTokenSourceOrEOF(src, lang)
+		}
+	case "vimdoc":
 		return func(src []byte, lang *gotreesitter.Language) gotreesitter.TokenSource {
 			return NewGenericTokenSourceOrEOF(src, lang)
 		}

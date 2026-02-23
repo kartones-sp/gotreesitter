@@ -738,9 +738,14 @@ func extractFieldMapSlices(source string, g *ExtractedGrammar) ([][2]uint16, err
 
 // extractFieldMapEntries parses ts_field_map[].
 func extractFieldMapEntries(source string, g *ExtractedGrammar) ([]FieldMapEntry, error) {
-	body, err := findArrayBody(source, "ts_field_map")
+	// Modern tree-sitter generators use "ts_field_map_entries"; older
+	// generators (and our test fixture) used plain "ts_field_map".
+	body, err := findArrayBody(source, "ts_field_map_entries")
 	if err != nil {
-		return nil, err
+		body, err = findArrayBody(source, "ts_field_map")
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Map entries by their array index first.

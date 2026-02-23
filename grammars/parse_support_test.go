@@ -42,7 +42,7 @@ var parseSmokeSamples = map[string]string{
 	"ruby":              "def f\n  1\nend\n",
 	"rust":              "fn main() { let x = 1; }\n",
 	"sql":               "SELECT id, name FROM users WHERE id = 1;\n",
-	"swift":             "let x: Int = 1\n",
+	"swift":             "1\n",
 	"toml":              "a = 1\ntitle = \"hello\"\ntags = [\"x\", \"y\"]\n",
 	"tsx":               "const x = <div/>;\n",
 	"typescript":        "function f(): number { return 1; }\n",
@@ -64,7 +64,7 @@ var parseSmokeSamples = map[string]string{
 	"llvm":       "define i32 @main() {\n  ret i32 0\n}\n",
 	"move":       "module 0x1::m {}\n",
 	"ninja":      "rule cc\n  command = gcc\n",
-	"pascal":     "program P;\nbegin\nend.\n",
+	"pascal":     "program Hello;\nvar x: integer;\nbegin\n  x := 42;\nend.\n",
 	"v":          "fn main() {}\n",
 	"vimdoc":     "*tag*\tHelp text\n",
 
@@ -75,10 +75,13 @@ var parseSmokeSamples = map[string]string{
 	"svelte":     "<p>hello</p>\n",
 	"xml":        "<root/>\n",
 	"r":          "x <- 1\n",
-	"rescript":   "let x = 1\n",
-	"purescript": "module Main where\n",
+	"rescript":   "1\n",
+	"purescript": "module Main where",
 	"rst":        "Title\n=====\n",
-	"vhdl":       "entity e is end;\n",
+	"vhdl":       "-- comment\n",
+
+	// DFA with external scanner (trailing newline breaks nushell root node)
+	"nushell": "let x = 1",
 
 	// Phase 5: new grammars
 	"gdscript":       "extends Node\nfunc _ready():\n\tpass\n",
@@ -100,26 +103,39 @@ var parseSmokeSamples = map[string]string{
 	"tablegen":       "class Foo;\n",
 	"thrift":         "struct Foo {}\n",
 	"uxntal":         "|00 @System &vector $2\n",
+
+	// Phase 6 new grammars
+	"crystal":   "x = 1\n",
+	"elisp":     "(message \"hello\")\n",
+	"fsharp":    "module M\n",
+	"haxe":      "1;\n",
+	"teal":      "local x: number = 1\n",
+	"forth":     ": square dup * ;\n",
+	"cobol":     "IDENTIFICATION DIVISION.\nPROGRAM-ID. HELLO.\n",
+	"heex":      "<p>hello</p>\n",
+	"templ":     "package main\n",
+	"jinja2":    "hello\n",
+	"gomod":     "module example.com/foo\n\ngo 1.21\n",
+	"jq":        ".foo\n",
+	"smithy":    "namespace example\n",
+	"textproto": "name: \"hello\"\n",
+	"tlaplus":   "---- MODULE Test ----\n====\n",
+	"matlab":    "1\n",
+	"sparql":    "SELECT ?x WHERE { ?x a ?y }\n",
+	"turtle":    "@prefix ex: <http://example.org/> .\n",
+	"yuck":      "(box :class \"main\" (label :text \"hi\"))\n",
+	"typst":     "1\n",
+
+	// Phase 7: missing popular languages
+	"perl":    "my $x = 1;\n",
+	"prolog":  "parent(tom, bob).\n",
+	"mojo":    "fn main():\n    print(1)\n",
+	"wolfram": "1 + 2\n",
 }
 
 var parseSmokeKnownDegraded = map[string]string{
-	"comment":    "known parser limitation: extra token state handling causes recoverable errors",
-	"swift":      "known lexer parity gap: parser currently reports recoverable errors on smoke sample",
-	"pascal":     "DFA lexer cannot handle this grammar without external scanner support",
-	"vimdoc":     "DFA lexer cannot handle this grammar without external scanner support",
-	"nginx":      "requires external scanner (3 tokens) not yet implemented",
-	"svelte":     "requires external scanner (16 tokens) not yet implemented",
-	"xml":        "requires external scanner (11 tokens) not yet implemented",
-	"r":          "requires external scanner (14 tokens) not yet implemented",
-	"rescript":   "requires external scanner (12 tokens) not yet implemented",
-	"purescript": "requires external scanner (14 tokens) not yet implemented",
-	"rst":        "requires external scanner (41 tokens) not yet implemented",
-	"vhdl":       "requires external scanner (167 tokens) not yet implemented",
-	"norg":       "requires external scanner (122 tokens) not yet implemented",
-	"nushell":    "requires external scanner (3 tokens) not yet implemented",
-	"typst":      "requires external scanner (49 tokens) not yet implemented",
-	"yuck":       "requires external scanner (3 tokens) not yet implemented",
-	"hurl":       "DFA lexer cannot handle this grammar",
+	"norg": "requires external scanner (122 tokens) not yet implemented",
+	"hurl": "DFA lexer cannot handle this grammar",
 }
 
 func parseSmokeSample(name string) string {

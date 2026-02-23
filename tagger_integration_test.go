@@ -33,9 +33,8 @@ func main() {
 		}))
 	}
 
-	// Note: field-based matching (e.g. name: (identifier)) requires FieldMapEntries
-	// in the grammar blob. Current blobs don't include these, so we use positional
-	// matching instead.
+	// Use positional matching for this test — field-based matching also works
+	// now that grammar blobs include FieldMapEntries.
 	tagger, err := gotreesitter.NewTagger(lang, `
 (function_declaration (identifier) @name) @definition.function
 (method_declaration (field_identifier) @name) @definition.method
@@ -84,8 +83,7 @@ func hello() {}
 	var funcNames []string
 	gotreesitter.Walk(bt.RootNode(), func(node *gotreesitter.Node, depth int) gotreesitter.WalkAction {
 		if bt.NodeType(node) == "function_declaration" {
-			// Find the identifier child (function name) by type rather than field,
-			// since grammar blobs don't currently include FieldMapEntries.
+			// Walk children by type (field-based lookup via ChildByFieldName also works).
 			for i := 0; i < node.ChildCount(); i++ {
 				child := node.Child(i)
 				if bt.NodeType(child) == "identifier" {

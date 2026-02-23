@@ -227,3 +227,37 @@ yuck https://github.com/Philipp-M/tree-sitter-yuck src .yuck
 hurl https://github.com/pfeiferj/tree-sitter-hurl src .hurl
 hyprlang https://github.com/tree-sitter-grammars/tree-sitter-hyprlang src .conf
 pem https://github.com/ObserverOfTime/tree-sitter-pem src .pem
+
+# === Phase 6 expansion ===
+
+# Programming Languages
+crystal https://github.com/keidax/tree-sitter-crystal src .cr
+elisp https://github.com/Wilfred/tree-sitter-elisp src .el
+fsharp https://github.com/ionide/tree-sitter-fsharp fsharp/src .fs,.fsi,.fsx
+haxe https://github.com/vantreeseba/tree-sitter-haxe src .hx
+teal https://github.com/euclidianAce/tree-sitter-teal src .tl
+forth https://github.com/AlexanderBrevig/tree-sitter-forth src .fs,.fth,.4th
+cobol https://github.com/yutaro-sakamoto/tree-sitter-cobol src .cob,.cbl,.cpy
+
+# Web & Templating
+heex https://github.com/phoenixframework/tree-sitter-heex src .heex
+templ https://github.com/vrischmann/tree-sitter-templ src .templ
+jinja2 https://github.com/dbt-labs/tree-sitter-jinja2 src .j2,.jinja2,.jinja
+
+# Data & Config
+gomod https://github.com/camdencheek/tree-sitter-go-mod src
+jq https://github.com/nverno/tree-sitter-jq src .jq
+smithy https://github.com/indoorvivants/tree-sitter-smithy src .smithy
+textproto https://github.com/PorterAtGoogle/tree-sitter-textproto src .textproto,.txtpb,.pbtxt
+
+# Formal & Scientific
+tlaplus https://github.com/tlaplus-community/tree-sitter-tlaplus src .tla
+matlab https://github.com/acristoffers/tree-sitter-matlab src .m,.mat
+sparql https://github.com/GordianDziwis/tree-sitter-sparql src .rq,.sparql
+turtle https://github.com/GordianDziwis/tree-sitter-turtle src .ttl
+
+# Phase 7: Missing popular languages
+perl https://github.com/tree-sitter-perl/tree-sitter-perl 0c24d001dd1921e418fb933d208a7bd7dd3f923a src .pl,.pm
+prolog https://github.com/Rukiza/tree-sitter-prolog src .pl,.pro
+mojo https://github.com/HerringtonDarkholme/tree-sitter-mojo src .mojo,.🔥
+wolfram https://github.com/bostick/tree-sitter-wolfram src .wl,.m,.nb

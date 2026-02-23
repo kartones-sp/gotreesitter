@@ -15,6 +15,7 @@ type LangEntry struct {
 	HighlightQuery     string
 	TagsQuery          string                                                                 // tree-sitter tags.scm query for symbol extraction
 	TokenSourceFactory func(src []byte, lang *gotreesitter.Language) gotreesitter.TokenSource // nil = use DFA
+	Quality            ParseQuality                                                           // populated lazily by AllLanguages
 }
 
 var registry []LangEntry
@@ -65,6 +66,14 @@ func AllLanguages() []LangEntry {
 			continue
 		}
 		out[i].TagsQuery = inferredTagsQuery(out[i])
+	}
+	for i := range out {
+		if out[i].Quality != "" {
+			continue
+		}
+		lang := out[i].Language()
+		report := EvaluateParseSupport(out[i], lang)
+		out[i].Quality = qualityFromBackend(report.Backend)
 	}
 	return out
 }

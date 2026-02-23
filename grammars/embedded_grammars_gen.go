@@ -134,6 +134,11 @@ func CmakeLanguage() *gotreesitter.Language {
 	return loadEmbeddedLanguage("cmake.bin")
 }
 
+// CobolLanguage returns the cobol language definition.
+func CobolLanguage() *gotreesitter.Language {
+	return loadEmbeddedLanguage("cobol.bin")
+}
+
 // CommentLanguage returns the comment language definition.
 func CommentLanguage() *gotreesitter.Language {
 	return loadEmbeddedLanguage("comment.bin")
@@ -162,6 +167,11 @@ func CponLanguage() *gotreesitter.Language {
 // CppLanguage returns the cpp language definition.
 func CppLanguage() *gotreesitter.Language {
 	return loadEmbeddedLanguage("cpp.bin")
+}
+
+// CrystalLanguage returns the crystal language definition.
+func CrystalLanguage() *gotreesitter.Language {
+	return loadEmbeddedLanguage("crystal.bin")
 }
 
 // CssLanguage returns the css language definition.
@@ -274,6 +284,11 @@ func EexLanguage() *gotreesitter.Language {
 	return loadEmbeddedLanguage("eex.bin")
 }
 
+// ElispLanguage returns the elisp language definition.
+func ElispLanguage() *gotreesitter.Language {
+	return loadEmbeddedLanguage("elisp.bin")
+}
+
 // ElixirLanguage returns the elixir language definition.
 func ElixirLanguage() *gotreesitter.Language {
 	return loadEmbeddedLanguage("elixir.bin")
@@ -339,9 +354,19 @@ func FoamLanguage() *gotreesitter.Language {
 	return loadEmbeddedLanguage("foam.bin")
 }
 
+// ForthLanguage returns the forth language definition.
+func ForthLanguage() *gotreesitter.Language {
+	return loadEmbeddedLanguage("forth.bin")
+}
+
 // FortranLanguage returns the fortran language definition.
 func FortranLanguage() *gotreesitter.Language {
 	return loadEmbeddedLanguage("fortran.bin")
+}
+
+// FsharpLanguage returns the fsharp language definition.
+func FsharpLanguage() *gotreesitter.Language {
+	return loadEmbeddedLanguage("fsharp.bin")
 }
 
 // GdscriptLanguage returns the gdscript language definition.
@@ -399,6 +424,11 @@ func GodotResourceLanguage() *gotreesitter.Language {
 	return loadEmbeddedLanguage("godot_resource.bin")
 }
 
+// GomodLanguage returns the gomod language definition.
+func GomodLanguage() *gotreesitter.Language {
+	return loadEmbeddedLanguage("gomod.bin")
+}
+
 // GraphqlLanguage returns the graphql language definition.
 func GraphqlLanguage() *gotreesitter.Language {
 	return loadEmbeddedLanguage("graphql.bin")
@@ -424,9 +454,19 @@ func HaskellLanguage() *gotreesitter.Language {
 	return loadEmbeddedLanguage("haskell.bin")
 }
 
+// HaxeLanguage returns the haxe language definition.
+func HaxeLanguage() *gotreesitter.Language {
+	return loadEmbeddedLanguage("haxe.bin")
+}
+
 // HclLanguage returns the hcl language definition.
 func HclLanguage() *gotreesitter.Language {
 	return loadEmbeddedLanguage("hcl.bin")
+}
+
+// HeexLanguage returns the heex language definition.
+func HeexLanguage() *gotreesitter.Language {
+	return loadEmbeddedLanguage("heex.bin")
 }
 
 // HlslLanguage returns the hlsl language definition.
@@ -472,6 +512,16 @@ func JavaLanguage() *gotreesitter.Language {
 // JavascriptLanguage returns the javascript language definition.
 func JavascriptLanguage() *gotreesitter.Language {
 	return loadEmbeddedLanguage("javascript.bin")
+}
+
+// Jinja2Language returns the jinja2 language definition.
+func Jinja2Language() *gotreesitter.Language {
+	return loadEmbeddedLanguage("jinja2.bin")
+}
+
+// JqLanguage returns the jq language definition.
+func JqLanguage() *gotreesitter.Language {
+	return loadEmbeddedLanguage("jq.bin")
 }
 
 // JsdocLanguage returns the jsdoc language definition.
@@ -569,6 +619,11 @@ func MarkdownInlineLanguage() *gotreesitter.Language {
 	return loadEmbeddedLanguage("markdown_inline.bin")
 }
 
+// MatlabLanguage returns the matlab language definition.
+func MatlabLanguage() *gotreesitter.Language {
+	return loadEmbeddedLanguage("matlab.bin")
+}
+
 // MermaidLanguage returns the mermaid language definition.
 func MermaidLanguage() *gotreesitter.Language {
 	return loadEmbeddedLanguage("mermaid.bin")
@@ -577,6 +632,11 @@ func MermaidLanguage() *gotreesitter.Language {
 // MesonLanguage returns the meson language definition.
 func MesonLanguage() *gotreesitter.Language {
 	return loadEmbeddedLanguage("meson.bin")
+}
+
+// MojoLanguage returns the mojo language definition.
+func MojoLanguage() *gotreesitter.Language {
+	return loadEmbeddedLanguage("mojo.bin")
 }
 
 // MoveLanguage returns the move language definition.
@@ -649,6 +709,11 @@ func PemLanguage() *gotreesitter.Language {
 	return loadEmbeddedLanguage("pem.bin")
 }
 
+// PerlLanguage returns the perl language definition.
+func PerlLanguage() *gotreesitter.Language {
+	return loadEmbeddedLanguage("perl.bin")
+}
+
 // PhpLanguage returns the php language definition.
 func PhpLanguage() *gotreesitter.Language {
 	return loadEmbeddedLanguage("php.bin")
@@ -667,6 +732,11 @@ func PowershellLanguage() *gotreesitter.Language {
 // PrismaLanguage returns the prisma language definition.
 func PrismaLanguage() *gotreesitter.Language {
 	return loadEmbeddedLanguage("prisma.bin")
+}
+
+// PrologLanguage returns the prolog language definition.
+func PrologLanguage() *gotreesitter.Language {
+	return loadEmbeddedLanguage("prolog.bin")
 }
 
 // PromqlLanguage returns the promql language definition.
@@ -779,9 +849,19 @@ func ScssLanguage() *gotreesitter.Language {
 	return loadEmbeddedLanguage("scss.bin")
 }
 
+// SmithyLanguage returns the smithy language definition.
+func SmithyLanguage() *gotreesitter.Language {
+	return loadEmbeddedLanguage("smithy.bin")
+}
+
 // SolidityLanguage returns the solidity language definition.
 func SolidityLanguage() *gotreesitter.Language {
 	return loadEmbeddedLanguage("solidity.bin")
+}
+
+// SparqlLanguage returns the sparql language definition.
+func SparqlLanguage() *gotreesitter.Language {
+	return loadEmbeddedLanguage("sparql.bin")
 }
 
 // SqlLanguage returns the sql language definition.
@@ -824,9 +904,29 @@ func TclLanguage() *gotreesitter.Language {
 	return loadEmbeddedLanguage("tcl.bin")
 }
 
+// TealLanguage returns the teal language definition.
+func TealLanguage() *gotreesitter.Language {
+	return loadEmbeddedLanguage("teal.bin")
+}
+
+// TemplLanguage returns the templ language definition.
+func TemplLanguage() *gotreesitter.Language {
+	return loadEmbeddedLanguage("templ.bin")
+}
+
+// TextprotoLanguage returns the textproto language definition.
+func TextprotoLanguage() *gotreesitter.Language {
+	return loadEmbeddedLanguage("textproto.bin")
+}
+
 // ThriftLanguage returns the thrift language definition.
 func ThriftLanguage() *gotreesitter.Language {
 	return loadEmbeddedLanguage("thrift.bin")
+}
+
+// TlaplusLanguage returns the tlaplus language definition.
+func TlaplusLanguage() *gotreesitter.Language {
+	return loadEmbeddedLanguage("tlaplus.bin")
 }
 
 // TmuxLanguage returns the tmux language definition.
@@ -847,6 +947,11 @@ func TomlLanguage() *gotreesitter.Language {
 // TsxLanguage returns the tsx language definition.
 func TsxLanguage() *gotreesitter.Language {
 	return loadEmbeddedLanguage("tsx.bin")
+}
+
+// TurtleLanguage returns the turtle language definition.
+func TurtleLanguage() *gotreesitter.Language {
+	return loadEmbeddedLanguage("turtle.bin")
 }
 
 // TwigLanguage returns the twig language definition.
@@ -897,6 +1002,11 @@ func VueLanguage() *gotreesitter.Language {
 // WgslLanguage returns the wgsl language definition.
 func WgslLanguage() *gotreesitter.Language {
 	return loadEmbeddedLanguage("wgsl.bin")
+}
+
+// WolframLanguage returns the wolfram language definition.
+func WolframLanguage() *gotreesitter.Language {
+	return loadEmbeddedLanguage("wolfram.bin")
 }
 
 // XmlLanguage returns the xml language definition.
