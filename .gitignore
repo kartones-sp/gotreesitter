@@ -9,6 +9,7 @@
 # Build artifacts
 scannertest
 ts2go
+parity_report
 
 # Logs
 *.log

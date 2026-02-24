@@ -149,14 +149,6 @@ func (p *Parser) ParseIncrementalWithTokenSource(source []byte, oldTree *Tree, t
 	return p.parseIncrementalInternal(source, oldTree, ts), nil
 }
 
-func (p *Parser) canUseDFALexer() bool {
-	return p.language != nil && len(p.language.LexStates) > 0
-}
-
-func (p *Parser) languageCompatible() bool {
-	return p.language != nil && p.language.CompatibleWithRuntime()
-}
-
 // ErrNoLanguage is returned when a Parser has no language configured.
 var ErrNoLanguage = errors.New("parser has no language configured")
 
