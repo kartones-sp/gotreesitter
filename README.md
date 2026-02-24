@@ -182,20 +182,16 @@ The incremental hot path reuses subtrees aggressively — a single-byte edit rep
 205 grammars ship in the registry. Run `go run ./cmd/parity_report` for live per-language status.
 
 Current summary:
-- **204 clean** — parse without errors
-- **1 degraded** — `norg` (requires external scanner with 122 tokens, not yet implemented)
+- **204 full** — parse without errors (token source or DFA with complete external scanner)
+- **1 partial** — `norg` (requires external scanner with 122 tokens, not yet implemented)
 - **0 unsupported**
 
-Quality breakdown:
-- **116 full** — token source or DFA with complete external scanner
-- **89 partial** — DFA-partial (missing external scanner, tree may have silent gaps)
-
 Backend breakdown:
-- **92 dfa** — lexer fully generated from grammar tables
-- **89 dfa-partial** — generated DFA without external scanner
-- **24 token_source** — hand-written or generic pure-Go lexer bridge
+- **195 dfa** — DFA lexer with hand-written Go external scanner where needed
+- **1 dfa-partial** — generated DFA without external scanner (`norg`)
+- **9 token_source** — hand-written pure-Go lexer bridge (authzed, c, go, html, java, json, lua, toml, yaml)
 
-12 languages have hand-written Go external scanners: python, elixir, comment, doxygen, foam, nginx, nushell, r, xml, yuck, purescript, typst.
+111 languages have hand-written Go external scanners attached via `zzz_scanner_attachments.go`.
 
 **Full language list (205):**
 `ada`, `agda`, `angular`, `apex`, `arduino`, `asm`, `astro`, `authzed`, `awk`, `bash`, `bass`, `beancount`, `bibtex`, `bicep`, `bitbake`, `blade`, `brightscript`, `c`, `c_sharp`, `caddy`, `cairo`, `capnp`, `chatito`, `circom`, `clojure`, `cmake`, `cobol`, `comment`, `commonlisp`, `cooklang`, `corn`, `cpon`, `cpp`, `crystal`, `css`, `csv`, `cuda`, `cue`, `cylc`, `d`, `dart`, `desktop`, `devicetree`, `dhall`, `diff`, `disassembly`, `djot`, `dockerfile`, `dot`, `doxygen`, `dtd`, `earthfile`, `ebnf`, `editorconfig`, `eds`, `eex`, `elisp`, `elixir`, `elm`, `elsa`, `embedded_template`, `enforce`, `erlang`, `facility`, `faust`, `fennel`, `fidl`, `firrtl`, `fish`, `foam`, `forth`, `fortran`, `fsharp`, `gdscript`, `git_config`, `git_rebase`, `gitattributes`, `gitcommit`, `gitignore`, `gleam`, `glsl`, `gn`, `go`, `godot_resource`, `gomod`, `graphql`, `groovy`, `hack`, `hare`, `haskell`, `haxe`, `hcl`, `heex`, `hlsl`, `html`, `http`, `hurl`, `hyprlang`, `ini`, `janet`, `java`, `javascript`, `jinja2`, `jq`, `jsdoc`, `json`, `json5`, `jsonnet`, `julia`, `just`, `kconfig`, `kdl`, `kotlin`, `ledger`, `less`, `linkerscript`, `liquid`, `llvm`, `lua`, `luau`, `make`, `markdown`, `markdown_inline`, `matlab`, `mermaid`, `meson`, `mojo`, `move`, `nginx`, `nickel`, `nim`, `ninja`, `nix`, `norg`, `nushell`, `objc`, `ocaml`, `odin`, `org`, `pascal`, `pem`, `perl`, `php`, `pkl`, `powershell`, `prisma`, `prolog`, `promql`, `properties`, `proto`, `pug`, `puppet`, `purescript`, `python`, `ql`, `r`, `racket`, `regex`, `rego`, `requirements`, `rescript`, `robot`, `ron`, `rst`, `ruby`, `rust`, `scala`, `scheme`, `scss`, `smithy`, `solidity`, `sparql`, `sql`, `squirrel`, `ssh_config`, `starlark`, `svelte`, `swift`, `tablegen`, `tcl`, `teal`, `templ`, `textproto`, `thrift`, `tlaplus`, `tmux`, `todotxt`, `toml`, `tsx`, `turtle`, `twig`, `typescript`, `typst`, `uxntal`, `v`, `verilog`, `vhdl`, `vimdoc`, `vue`, `wgsl`, `wolfram`, `xml`, `yaml`, `yuck`, `zig`
@@ -232,7 +228,7 @@ No known query-syntax gaps currently block shipped highlight or tags queries.
 
 ### DFA-partial languages
 
-89 languages require an external scanner that has not been ported to Go. These parse successfully using the DFA lexer alone, but tokens that require the external scanner are silently skipped. The tree structure is valid but may have gaps. Check `entry.Quality` to distinguish `full` from `partial`.
+1 language (`norg`) requires an external scanner that has not been ported to Go. It parses using the DFA lexer alone, but tokens that require the external scanner are silently skipped. The tree structure is valid but may have gaps. Check `entry.Quality` to distinguish `full` from `partial`.
 
 ---
 
