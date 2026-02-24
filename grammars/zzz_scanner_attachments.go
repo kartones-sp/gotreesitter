@@ -122,6 +122,9 @@ func init() {
 		"javascript":      JavaScriptExternalScanner{},
 		"typescript":      TypeScriptExternalScanner{},
 		"rust":            RustExternalScanner{},
+		"hcl":             HclExternalScanner{},
+		"rescript":        RescriptExternalScanner{},
+		"svelte":          SvelteExternalScanner{},
 	}
 
 	for i := range registry {
