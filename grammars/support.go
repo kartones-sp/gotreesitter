@@ -175,14 +175,6 @@ func defaultTokenSourceFactory(name string) func(src []byte, lang *gotreesitter.
 		return func(src []byte, lang *gotreesitter.Language) gotreesitter.TokenSource {
 			return NewGenericTokenSourceOrEOF(src, lang)
 		}
-	case "comment":
-		return func(src []byte, lang *gotreesitter.Language) gotreesitter.TokenSource {
-			return NewGenericTokenSourceOrEOF(src, lang)
-		}
-	case "nginx":
-		return func(src []byte, lang *gotreesitter.Language) gotreesitter.TokenSource {
-			return NewGenericTokenSourceOrEOF(src, lang)
-		}
 	case "rst":
 		return func(src []byte, lang *gotreesitter.Language) gotreesitter.TokenSource {
 			return NewGenericTokenSourceOrEOF(src, lang)
