@@ -3,7 +3,7 @@
 package grammars
 
 const asmTagsQuery = `
-(label (ident) @name) @definition.function
+(ident) @name @definition.function
 `
 
 func init() {
