@@ -56,12 +56,16 @@ var parseSmokeSamples = map[string]string{
 	"ocaml":             "let x = 1\n",
 	"verilog":           "module m;\nendmodule\n",
 
+	// RE/binary analysis grammars
+	"asm":         "main:\n    mov eax, 1\n    ret\n",
+	"disassembly": "0000000000001000 <main>:\n    1000: 55                   push   rbp\n",
+
 	// Phase 2: DFA-only languages
 	"dot":        "digraph G { a -> b; }\n",
 	"git_config": "[core]\n\tbare = false\n",
 	"ini":        "[section]\nkey = value\n",
 	"json5":      "{ \"key\": \"value\" }\n",
-	"llvm":       "define i32 @main() {\n  ret i32 0\n}\n",
+	"llvm":       "define i32 @main() {\n  call void @puts()\n  ret i32 0\n}\n",
 	"move":       "module 0x1::m {}\n",
 	"ninja":      "rule cc\n  command = gcc\n",
 	"pascal":     "program Hello;\nvar x: integer;\nbegin\n  x := 42;\nend.\n",

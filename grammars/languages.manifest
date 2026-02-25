@@ -45,7 +45,7 @@ ada https://github.com/briot/tree-sitter-ada src
 angular https://github.com/dlvandenberg/tree-sitter-angular src
 apex https://github.com/aheber/tree-sitter-sfapex apex/src
 arduino https://github.com/ObserverOfTime/tree-sitter-arduino src
-asm https://github.com/RubixDev/tree-sitter-asm src
+asm https://github.com/RubixDev/tree-sitter-asm src .s,.asm
 astro https://github.com/virchau13/tree-sitter-astro src
 authzed https://github.com/mleonidas/tree-sitter-authzed src
 awk https://github.com/Beaglefoot/tree-sitter-awk src
@@ -76,7 +76,7 @@ dart https://github.com/UserNobody14/tree-sitter-dart src
 desktop https://github.com/ValdezFOmar/tree-sitter-desktop src
 devicetree https://github.com/joelspadin/tree-sitter-devicetree src
 diff https://github.com/the-mikedavis/tree-sitter-diff src
-disassembly https://github.com/ColinKennedy/tree-sitter-disassembly src
+disassembly https://github.com/ColinKennedy/tree-sitter-disassembly src .dis,.dump
 djot https://github.com/treeman/tree-sitter-djot src
 dockerfile https://github.com/camdencheek/tree-sitter-dockerfile src
 doxygen https://github.com/amaanq/tree-sitter-doxygen src
