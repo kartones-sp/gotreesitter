@@ -402,3 +402,85 @@ func TestTreeCursorGotoLastNamedChild(t *testing.T) {
 		t.Fatal("GotoLastNamedChild should return false on parameter_list with only anonymous children")
 	}
 }
+
+func TestTreeCursorGotoFirstChildForByte(t *testing.T) {
+	lang := queryTestLanguage()
+	tree := buildSimpleTree(lang)
+	// Tree: func main() { 42 }
+	// function_declaration children:
+	//   func(0-4), identifier(5-9), parameter_list(9-11), block(14-16? endByte from tree)
+
+	c := NewTreeCursor(tree.RootNode(), tree)
+	c.GotoFirstChild() // function_declaration
+
+	// Byte 6 is inside "main" (5-9), so first child where endByte > 6 is identifier
+	if !c.GotoFirstChildForByte(6) {
+		t.Fatal("GotoFirstChildForByte(6) should succeed")
+	}
+	if c.CurrentNode().Symbol() != Symbol(1) {
+		t.Fatalf("expected identifier (1), got %d", c.CurrentNode().Symbol())
+	}
+
+	// Go back and try byte 0, should land on "func" keyword
+	c.GotoParent()
+	if !c.GotoFirstChildForByte(0) {
+		t.Fatal("GotoFirstChildForByte(0) should succeed")
+	}
+	if c.CurrentNode().Symbol() != Symbol(8) {
+		t.Fatalf("expected func keyword (8), got %d", c.CurrentNode().Symbol())
+	}
+
+	// Try byte 15, should land on block (which contains number at 14-16)
+	c.GotoParent()
+	if !c.GotoFirstChildForByte(15) {
+		t.Fatal("GotoFirstChildForByte(15) should succeed")
+	}
+	if c.CurrentNode().Symbol() != Symbol(14) {
+		t.Fatalf("expected block (14), got %d", c.CurrentNode().Symbol())
+	}
+}
+
+func TestTreeCursorGotoFirstChildForByteOutOfRange(t *testing.T) {
+	lang := queryTestLanguage()
+	tree := buildSimpleTree(lang)
+
+	c := NewTreeCursor(tree.RootNode(), tree)
+	c.GotoFirstChild() // function_declaration
+
+	// Byte way past end of all children
+	if c.GotoFirstChildForByte(9999) {
+		t.Fatal("GotoFirstChildForByte with out-of-range byte should return false")
+	}
+
+	// Leaf node
+	c.GotoFirstChild() // "func" keyword
+	if c.GotoFirstChildForByte(0) {
+		t.Fatal("GotoFirstChildForByte on leaf should return false")
+	}
+}
+
+func TestTreeCursorGotoFirstChildForPoint(t *testing.T) {
+	lang := queryTestLanguage()
+	tree := buildSimpleTree(lang)
+	// All nodes in buildSimpleTree are on row 0 with column == byte offset
+
+	c := NewTreeCursor(tree.RootNode(), tree)
+	c.GotoFirstChild() // function_declaration
+
+	// Point at column 6 (inside "main") should land on identifier
+	if !c.GotoFirstChildForPoint(Point{Row: 0, Column: 6}) {
+		t.Fatal("GotoFirstChildForPoint should succeed")
+	}
+	if c.CurrentNode().Symbol() != Symbol(1) {
+		t.Fatalf("expected identifier (1), got %d", c.CurrentNode().Symbol())
+	}
+
+	// Point at column 0 should land on "func" keyword
+	c.GotoParent()
+	if !c.GotoFirstChildForPoint(Point{Row: 0, Column: 0}) {
+		t.Fatal("GotoFirstChildForPoint(0,0) should succeed")
+	}
+	if c.CurrentNode().Symbol() != Symbol(8) {
+		t.Fatalf("expected func keyword (8), got %d", c.CurrentNode().Symbol())
+	}
+}

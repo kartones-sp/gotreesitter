@@ -230,3 +230,32 @@ func (c *TreeCursor) GotoPrevNamedSibling() bool {
 	}
 	return false
 }
+
+// GotoFirstChildForByte moves the cursor to the first child whose byte range
+// contains targetByte (i.e., the first child where endByte > targetByte).
+// Returns false if the current node has no children or targetByte is past all children.
+func (c *TreeCursor) GotoFirstChildForByte(targetByte uint32) bool {
+	node := c.CurrentNode()
+	for i, child := range node.children {
+		if child.endByte > targetByte {
+			c.stack = append(c.stack, cursorFrame{node: child, childIndex: i})
+			return true
+		}
+	}
+	return false
+}
+
+// GotoFirstChildForPoint moves the cursor to the first child whose point range
+// contains targetPoint (i.e., the first child where endPoint > targetPoint).
+// Returns false if the current node has no children or targetPoint is past all children.
+func (c *TreeCursor) GotoFirstChildForPoint(targetPoint Point) bool {
+	node := c.CurrentNode()
+	for i, child := range node.children {
+		ep := child.endPoint
+		if ep.Row > targetPoint.Row || (ep.Row == targetPoint.Row && ep.Column > targetPoint.Column) {
+			c.stack = append(c.stack, cursorFrame{node: child, childIndex: i})
+			return true
+		}
+	}
+	return false
+}
