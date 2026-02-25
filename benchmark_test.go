@@ -70,7 +70,10 @@ func BenchmarkGoParseFull(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		ts.Reset(src)
-		tree, _ := parser.ParseWithTokenSource(src, ts)
+		tree, err := parser.ParseWithTokenSource(src, ts)
+		if err != nil {
+			b.Fatalf("parse error: %v", err)
+		}
 		if tree.RootNode() == nil {
 			b.Fatal("parse returned nil root")
 		}
@@ -92,7 +95,10 @@ func BenchmarkGoParseIncrementalSingleByteEdit(b *testing.B) {
 	end := pointAtOffset(src, editAt+1)
 
 	ts := mustGoTokenSource(b, src, lang)
-	tree, _ := parser.ParseWithTokenSource(src, ts)
+	tree, err := parser.ParseWithTokenSource(src, ts)
+	if err != nil {
+		b.Fatalf("initial parse error: %v", err)
+	}
 	if tree.RootNode() == nil {
 		b.Fatal("initial parse returned nil root")
 	}
@@ -121,7 +127,11 @@ func BenchmarkGoParseIncrementalSingleByteEdit(b *testing.B) {
 		tree.Edit(edit)
 		ts.Reset(src)
 		old := tree
-		tree, _ = parser.ParseIncrementalWithTokenSource(src, tree, ts)
+		var err error
+		tree, err = parser.ParseIncrementalWithTokenSource(src, tree, ts)
+		if err != nil {
+			b.Fatalf("incremental parse error: %v", err)
+		}
 		if tree.RootNode() == nil {
 			b.Fatal("incremental parse returned nil root")
 		}
@@ -138,7 +148,10 @@ func BenchmarkGoParseIncrementalNoEdit(b *testing.B) {
 	src := makeGoBenchmarkSource(benchmarkFuncCount(b))
 	ts := mustGoTokenSource(b, src, lang)
 
-	tree, _ := parser.ParseWithTokenSource(src, ts)
+	tree, err := parser.ParseWithTokenSource(src, ts)
+	if err != nil {
+		b.Fatalf("initial parse error: %v", err)
+	}
 	if tree.RootNode() == nil {
 		b.Fatal("initial parse returned nil root")
 	}
@@ -150,7 +163,10 @@ func BenchmarkGoParseIncrementalNoEdit(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		ts.Reset(src)
 		old := tree
-		tree, _ = parser.ParseIncrementalWithTokenSource(src, tree, ts)
+		tree, err = parser.ParseIncrementalWithTokenSource(src, tree, ts)
+		if err != nil {
+			b.Fatalf("incremental parse error: %v", err)
+		}
 		if tree.RootNode() == nil {
 			b.Fatal("incremental parse returned nil root")
 		}

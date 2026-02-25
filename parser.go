@@ -1431,9 +1431,11 @@ func (p *Parser) buildResult(stack []stackEntry, source []byte, arena *nodeArena
 	if realRoot != nil && len(extras) > 0 {
 		// Fold extras into the real root as leading/trailing children.
 		merged := make([]*Node, 0, len(extras)+len(realRoot.children))
+		leadingCount := 0
 		for _, e := range extras {
 			if e.startByte <= realRoot.startByte {
 				merged = append(merged, e)
+				leadingCount++
 			}
 		}
 		merged = append(merged, realRoot.children...)
@@ -1448,6 +1450,13 @@ func (p *Parser) buildResult(stack []stackEntry, source []byte, arena *nodeArena
 			merged = out
 		}
 		realRoot.children = merged
+		// Keep fieldIDs aligned with children: extras have no field (0).
+		if len(realRoot.fieldIDs) > 0 {
+			trailingCount := len(extras) - leadingCount
+			padded := make([]FieldID, leadingCount+len(realRoot.fieldIDs)+trailingCount)
+			copy(padded[leadingCount:], realRoot.fieldIDs)
+			realRoot.fieldIDs = padded
+		}
 		// Extend root range to cover the extras.
 		for _, e := range extras {
 			if e.startByte < realRoot.startByte {

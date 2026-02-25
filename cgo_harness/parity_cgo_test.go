@@ -191,15 +191,16 @@ func parseWithGo(tc parityCase, src []byte, oldTree *gotreesitter.Tree) (*gotree
 	parser := gotreesitter.NewParser(lang)
 
 	var tree *gotreesitter.Tree
+	var parseErr error
 	if oldTree == nil {
 		switch report.Backend {
 		case grammars.ParseBackendTokenSource:
 			if entry.TokenSourceFactory == nil {
 				return nil, nil, fmt.Errorf("token source backend without factory for %q", tc.name)
 			}
-			tree, _ = parser.ParseWithTokenSource(src, entry.TokenSourceFactory(src, lang))
+			tree, parseErr = parser.ParseWithTokenSource(src, entry.TokenSourceFactory(src, lang))
 		case grammars.ParseBackendDFA, grammars.ParseBackendDFAPartial:
-			tree, _ = parser.Parse(src)
+			tree, parseErr = parser.Parse(src)
 		default:
 			return nil, nil, fmt.Errorf("unsupported parse backend %q for %q", report.Backend, tc.name)
 		}
@@ -209,12 +210,15 @@ func parseWithGo(tc parityCase, src []byte, oldTree *gotreesitter.Tree) (*gotree
 			if entry.TokenSourceFactory == nil {
 				return nil, nil, fmt.Errorf("token source backend without factory for %q", tc.name)
 			}
-			tree, _ = parser.ParseIncrementalWithTokenSource(src, oldTree, entry.TokenSourceFactory(src, lang))
+			tree, parseErr = parser.ParseIncrementalWithTokenSource(src, oldTree, entry.TokenSourceFactory(src, lang))
 		case grammars.ParseBackendDFA, grammars.ParseBackendDFAPartial:
-			tree, _ = parser.ParseIncremental(src, oldTree)
+			tree, parseErr = parser.ParseIncremental(src, oldTree)
 		default:
 			return nil, nil, fmt.Errorf("unsupported incremental backend %q for %q", report.Backend, tc.name)
 		}
+	}
+	if parseErr != nil {
+		return nil, nil, fmt.Errorf("gotreesitter parse error: %w", parseErr)
 	}
 
 	if tree == nil || tree.RootNode() == nil {

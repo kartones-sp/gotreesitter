@@ -889,3 +889,59 @@ func TestParserExternalScannerToken(t *testing.T) {
 		t.Fatalf("operator text = %q, want %q", got, "#")
 	}
 }
+
+// TestFieldIDsAlignAfterExtrasFold verifies that when buildResult folds
+// extra nodes (e.g. leading comments) into a root's children, the fieldIDs
+// slice is padded to maintain index alignment with children.
+//
+// Regression test for: prepending extras into realRoot.children without
+// updating fieldIDs caused ChildByFieldName to return wrong nodes.
+func TestFieldIDsAlignAfterExtrasFold(t *testing.T) {
+	lang := queryTestLanguage()
+
+	// Construct a parent with fielded children:
+	//   children:  [ident,        paramList,       block]
+	//   fieldIDs:  [name(1),      parameters(5),   body(2)]
+	ident := NewLeafNode(Symbol(1), true, 5, 9, Point{}, Point{})
+	paramList := NewLeafNode(Symbol(13), true, 9, 11, Point{}, Point{})
+	block := NewLeafNode(Symbol(14), true, 12, 20, Point{}, Point{})
+	root := NewParentNode(Symbol(5), true,
+		[]*Node{ident, paramList, block},
+		[]FieldID{1, 5, 2}, 0)
+
+	// Sanity: field lookups work before modification.
+	if got := root.ChildByFieldName("name", lang); got != ident {
+		t.Fatal("pre-check: name field should return ident")
+	}
+	if got := root.ChildByFieldName("body", lang); got != block {
+		t.Fatal("pre-check: body field should return block")
+	}
+
+	// Simulate what buildResult's extras fold does: prepend a leading extra.
+	extra := NewLeafNode(Symbol(0), false, 0, 3, Point{}, Point{})
+	extra.isExtra = true
+
+	leadingCount := 1
+	merged := make([]*Node, 0, 1+len(root.children))
+	merged = append(merged, extra)
+	merged = append(merged, root.children...)
+	root.children = merged
+
+	// Pad fieldIDs to match: extras get 0.
+	if len(root.fieldIDs) > 0 {
+		padded := make([]FieldID, leadingCount+len(root.fieldIDs))
+		copy(padded[leadingCount:], root.fieldIDs)
+		root.fieldIDs = padded
+	}
+
+	// Verify field lookups still return correct nodes.
+	if got := root.ChildByFieldName("name", lang); got != ident {
+		t.Fatalf("after fold: name field should return ident (sym 1), got sym %d", got.Symbol())
+	}
+	if got := root.ChildByFieldName("body", lang); got != block {
+		t.Fatalf("after fold: body field should return block (sym 14), got sym %d", got.Symbol())
+	}
+	if got := root.ChildByFieldName("parameters", lang); got != paramList {
+		t.Fatalf("after fold: parameters field should return paramList (sym 13), got sym %d", got.Symbol())
+	}
+}
