@@ -24,3 +24,6 @@ parity_report
 # OS
 .DS_Store
 Thumbs.db
+
+# Worktrees
+.worktrees/
