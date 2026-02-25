@@ -299,3 +299,106 @@ func TestTreeCursorFieldIDAtRoot(t *testing.T) {
 		t.Fatalf("field name at root should be empty, got %q", name)
 	}
 }
+
+func TestTreeCursorGotoFirstNamedChild(t *testing.T) {
+	lang := queryTestLanguage()
+	tree := buildSimpleTree(lang)
+
+	c := NewTreeCursor(tree.RootNode(), tree)
+	c.GotoFirstChild() // function_declaration
+
+	// function_declaration children: func(anon), identifier(named), parameter_list(named), block(named)
+	// GotoFirstNamedChild should skip "func" keyword and land on identifier
+	if !c.GotoFirstNamedChild() {
+		t.Fatal("GotoFirstNamedChild should succeed")
+	}
+	if c.CurrentNode().Symbol() != Symbol(1) {
+		t.Fatalf("expected identifier (1), got %d", c.CurrentNode().Symbol())
+	}
+}
+
+func TestTreeCursorGotoNextNamedSibling(t *testing.T) {
+	lang := queryTestLanguage()
+	tree := buildSimpleTree(lang)
+
+	c := NewTreeCursor(tree.RootNode(), tree)
+	c.GotoFirstChild()      // function_declaration
+	c.GotoFirstNamedChild() // identifier
+
+	// Next named sibling: parameter_list (13)
+	if !c.GotoNextNamedSibling() {
+		t.Fatal("GotoNextNamedSibling should succeed")
+	}
+	if c.CurrentNode().Symbol() != Symbol(13) {
+		t.Fatalf("expected parameter_list (13), got %d", c.CurrentNode().Symbol())
+	}
+
+	// Next named sibling: block (14)
+	if !c.GotoNextNamedSibling() {
+		t.Fatal("GotoNextNamedSibling should succeed")
+	}
+	if c.CurrentNode().Symbol() != Symbol(14) {
+		t.Fatalf("expected block (14), got %d", c.CurrentNode().Symbol())
+	}
+
+	// No more named siblings
+	if c.GotoNextNamedSibling() {
+		t.Fatal("GotoNextNamedSibling should return false at end")
+	}
+}
+
+func TestTreeCursorGotoPrevNamedSibling(t *testing.T) {
+	lang := queryTestLanguage()
+	tree := buildSimpleTree(lang)
+
+	c := NewTreeCursor(tree.RootNode(), tree)
+	c.GotoFirstChild() // function_declaration
+	c.GotoLastChild()  // block (14, named)
+
+	// Prev named sibling: parameter_list (13)
+	if !c.GotoPrevNamedSibling() {
+		t.Fatal("GotoPrevNamedSibling should succeed")
+	}
+	if c.CurrentNode().Symbol() != Symbol(13) {
+		t.Fatalf("expected parameter_list (13), got %d", c.CurrentNode().Symbol())
+	}
+
+	// Prev named sibling: identifier (1) — skips "func" keyword
+	if !c.GotoPrevNamedSibling() {
+		t.Fatal("GotoPrevNamedSibling should succeed")
+	}
+	if c.CurrentNode().Symbol() != Symbol(1) {
+		t.Fatalf("expected identifier (1), got %d", c.CurrentNode().Symbol())
+	}
+
+	// No more prev named siblings (func keyword is anonymous)
+	if c.GotoPrevNamedSibling() {
+		t.Fatal("GotoPrevNamedSibling should return false — func keyword is anonymous")
+	}
+}
+
+func TestTreeCursorGotoLastNamedChild(t *testing.T) {
+	lang := queryTestLanguage()
+	tree := buildSimpleTree(lang)
+
+	c := NewTreeCursor(tree.RootNode(), tree)
+	c.GotoFirstChild() // function_declaration
+
+	// Last named child: block (14)
+	if !c.GotoLastNamedChild() {
+		t.Fatal("GotoLastNamedChild should succeed")
+	}
+	if c.CurrentNode().Symbol() != Symbol(14) {
+		t.Fatalf("expected block (14), got %d", c.CurrentNode().Symbol())
+	}
+
+	// Test on parameter_list which has only anonymous children: "(" and ")"
+	c.GotoParent()               // back to function_declaration
+	c.GotoChildByFieldName("parameters") // parameter_list
+	if c.GotoFirstNamedChild() {
+		t.Fatal("GotoFirstNamedChild should return false on parameter_list with only anonymous children")
+	}
+	if c.GotoLastNamedChild() {
+		t.Fatal("GotoLastNamedChild should return false on parameter_list with only anonymous children")
+	}
+}

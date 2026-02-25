@@ -168,3 +168,65 @@ func (c *TreeCursor) GotoChildByFieldName(name string) bool {
 	}
 	return c.GotoChildByFieldID(fid)
 }
+
+// GotoFirstNamedChild moves the cursor to the first named child of the
+// current node, skipping anonymous nodes. Returns false if no named child exists.
+func (c *TreeCursor) GotoFirstNamedChild() bool {
+	node := c.CurrentNode()
+	for i, child := range node.children {
+		if child.isNamed {
+			c.stack = append(c.stack, cursorFrame{node: child, childIndex: i})
+			return true
+		}
+	}
+	return false
+}
+
+// GotoLastNamedChild moves the cursor to the last named child of the
+// current node, skipping anonymous nodes. Returns false if no named child exists.
+func (c *TreeCursor) GotoLastNamedChild() bool {
+	node := c.CurrentNode()
+	for i := len(node.children) - 1; i >= 0; i-- {
+		if node.children[i].isNamed {
+			c.stack = append(c.stack, cursorFrame{node: node.children[i], childIndex: i})
+			return true
+		}
+	}
+	return false
+}
+
+// GotoNextNamedSibling moves the cursor to the next named sibling,
+// skipping anonymous nodes. Returns false if no named sibling follows.
+func (c *TreeCursor) GotoNextNamedSibling() bool {
+	if len(c.stack) < 2 {
+		return false
+	}
+	frame := &c.stack[len(c.stack)-1]
+	parentNode := c.stack[len(c.stack)-2].node
+	for i := frame.childIndex + 1; i < len(parentNode.children); i++ {
+		if parentNode.children[i].isNamed {
+			frame.childIndex = i
+			frame.node = parentNode.children[i]
+			return true
+		}
+	}
+	return false
+}
+
+// GotoPrevNamedSibling moves the cursor to the previous named sibling,
+// skipping anonymous nodes. Returns false if no named sibling precedes.
+func (c *TreeCursor) GotoPrevNamedSibling() bool {
+	if len(c.stack) < 2 {
+		return false
+	}
+	frame := &c.stack[len(c.stack)-1]
+	parentNode := c.stack[len(c.stack)-2].node
+	for i := frame.childIndex - 1; i >= 0; i-- {
+		if parentNode.children[i].isNamed {
+			frame.childIndex = i
+			frame.node = parentNode.children[i]
+			return true
+		}
+	}
+	return false
+}
