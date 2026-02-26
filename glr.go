@@ -29,6 +29,12 @@ type glrStack struct {
 	// reducing stacks cause the same token to be re-processed, shifted
 	// stacks must be skipped since they already consumed it.
 	shifted bool
+	// recoverabilityKnown indicates whether mayRecover can be trusted as
+	// a conservative "stack may contain recover-capable states" bit.
+	recoverabilityKnown bool
+	// mayRecover is true when the stack is known to contain at least one
+	// state that can perform ParseActionRecover for some symbol.
+	mayRecover bool
 }
 
 const (

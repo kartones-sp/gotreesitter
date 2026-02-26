@@ -212,7 +212,7 @@ func (p *Parser) tryReuseSubtree(s *glrStack, lookahead Token, ts TokenSource, i
 		if !ok {
 			continue
 		}
-		return reuseNode(s, n, nextState, lookahead, ts, idx, entryScratch, gssScratch)
+		return reuseNode(p, s, n, nextState, lookahead, ts, idx, entryScratch, gssScratch)
 	}
 
 	// Conservative fallback: try small non-root non-leaf nodes. This increases
@@ -241,17 +241,17 @@ func (p *Parser) tryReuseSubtree(s *glrStack, lookahead Token, ts TokenSource, i
 		}
 	}
 	if bestIndex >= 0 {
-		return reuseNode(s, candidates[bestIndex], bestState, lookahead, ts, idx, entryScratch, gssScratch)
+		return reuseNode(p, s, candidates[bestIndex], bestState, lookahead, ts, idx, entryScratch, gssScratch)
 	}
 
 	return lookahead, 0, false
 }
 
-func reuseNode(s *glrStack, n *Node, nextState StateID, lookahead Token, ts TokenSource, idx *reuseCursor, entryScratch *glrEntryScratch, gssScratch *gssScratch) (Token, uint32, bool) {
+func reuseNode(p *Parser, s *glrStack, n *Node, nextState StateID, lookahead Token, ts TokenSource, idx *reuseCursor, entryScratch *glrEntryScratch, gssScratch *gssScratch) (Token, uint32, bool) {
 	if perfCountersEnabled {
 		perfRecordReuseSuccess()
 	}
-	s.push(nextState, n, entryScratch, gssScratch)
+	p.pushStackNode(s, nextState, n, entryScratch, gssScratch)
 	reusedBytes := n.EndByte() - n.StartByte()
 
 	// If the reused node reaches EOF, we can synthesize EOF directly

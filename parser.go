@@ -1448,6 +1448,8 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 	var stacksBuf [4]glrStack
 	stacks := stacksBuf[:1]
 	stacks[0] = newGLRStackWithScratch(p.language.InitialState, &scratch.entries)
+	stacks[0].recoverabilityKnown = true
+	stacks[0].mayRecover = p.stateCanRecover(p.language.InitialState)
 	if timing != nil && timing.maxStacksSeen < len(stacks) {
 		timing.maxStacksSeen = len(stacks)
 	}
@@ -1588,18 +1590,18 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 			}
 
 			// --- Extra token handling (comments, whitespace) ---
-			if len(actions) > 0 &&
-				actions[0].Type == ParseActionShift && actions[0].Extra {
-				named := p.isNamedSymbol(tok.Symbol)
-				leaf := newLeafNodeInArena(arena, tok.Symbol, named,
-					tok.StartByte, tok.EndByte, tok.StartPoint, tok.EndPoint)
-				leaf.isExtra = true
-				leaf.parseState = currentState
-				s.push(currentState, leaf, &scratch.entries, &scratch.gss)
-				nodeCount++
-				needToken = true
-				continue
-			}
+				if len(actions) > 0 &&
+					actions[0].Type == ParseActionShift && actions[0].Extra {
+					named := p.isNamedSymbol(tok.Symbol)
+					leaf := newLeafNodeInArena(arena, tok.Symbol, named,
+						tok.StartByte, tok.EndByte, tok.StartPoint, tok.EndPoint)
+					leaf.isExtra = true
+					leaf.parseState = currentState
+					p.pushStackNode(s, currentState, leaf, &scratch.entries, &scratch.gss)
+					nodeCount++
+					needToken = true
+					continue
+				}
 
 			// --- No action: error handling ---
 			if len(actions) == 0 {
@@ -1646,7 +1648,7 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 					tok.StartByte, tok.EndByte, tok.StartPoint, tok.EndPoint)
 				errNode.hasError = true
 				errNode.parseState = currentState
-				s.push(currentState, errNode, &scratch.entries, &scratch.gss)
+				p.pushStackNode(s, currentState, errNode, &scratch.entries, &scratch.gss)
 				nodeCount++
 				needToken = true
 				continue
@@ -1761,7 +1763,7 @@ func (p *Parser) applyAction(s *glrStack, act ParseAction, tok Token, anyReduced
 			tok.StartByte, tok.EndByte, tok.StartPoint, tok.EndPoint)
 		leaf.isExtra = act.Extra
 		leaf.parseState = act.State
-		s.push(act.State, leaf, entryScratch, gssScratch)
+		p.pushStackNode(s, act.State, leaf, entryScratch, gssScratch)
 		s.shifted = true
 		*nodeCount++
 
@@ -1808,8 +1810,18 @@ func (p *Parser) applyAction(s *glrStack, act ParseAction, tok Token, anyReduced
 			recoverState = act.State
 		}
 		errNode.parseState = recoverState
-		s.push(recoverState, errNode, entryScratch, gssScratch)
+		p.pushStackNode(s, recoverState, errNode, entryScratch, gssScratch)
 		*nodeCount++
+	}
+}
+
+func (p *Parser) pushStackNode(s *glrStack, state StateID, node *Node, entryScratch *glrEntryScratch, gssScratch *gssScratch) {
+	s.push(state, node, entryScratch, gssScratch)
+	if !s.recoverabilityKnown {
+		return
+	}
+	if !s.mayRecover && p.stateCanRecover(state) {
+		s.mayRecover = true
 	}
 }
 
@@ -1917,11 +1929,11 @@ func (p *Parser) applyReduceActionFromGSS(s *glrStack, act ParseAction, anyReduc
 		targetState = gotoState
 	}
 	parent.parseState = targetState
-	s.push(targetState, parent, entryScratch, gssScratch)
+	p.pushStackNode(s, targetState, parent, entryScratch, gssScratch)
 	for i := range trailingExtras {
 		extra := trailingExtras[i]
 		extra.parseState = targetState
-		s.push(targetState, extra, entryScratch, gssScratch)
+		p.pushStackNode(s, targetState, extra, entryScratch, gssScratch)
 	}
 
 	s.score += int(act.DynamicPrecedence)
@@ -2170,11 +2182,11 @@ func (p *Parser) applyReduceAction(s *glrStack, act ParseAction, anyReduced *boo
 		targetState = gotoState
 	}
 	parent.parseState = targetState
-	s.push(targetState, parent, entryScratch, gssScratch)
+	p.pushStackNode(s, targetState, parent, entryScratch, gssScratch)
 	for i := range trailingExtras {
 		extra := trailingExtras[i]
 		extra.parseState = targetState
-		s.push(targetState, extra, entryScratch, gssScratch)
+		p.pushStackNode(s, targetState, extra, entryScratch, gssScratch)
 	}
 
 	s.score += int(act.DynamicPrecedence)
@@ -2195,6 +2207,9 @@ func recoverAction(entry *ParseActionEntry) (ParseAction, bool) {
 
 func (p *Parser) findRecoverActionOnStack(s *glrStack, sym Symbol, timing *incrementalParseTiming) (int, ParseAction, bool) {
 	if s == nil {
+		return 0, ParseAction{}, false
+	}
+	if s.recoverabilityKnown && !s.mayRecover {
 		return 0, ParseAction{}, false
 	}
 	if timing != nil {
