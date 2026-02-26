@@ -23,6 +23,8 @@ type Parser struct {
 	reuseMu           sync.Mutex
 	fullArenaHint     uint32
 	hasRecoverState   []bool
+	hasRecoverSymbol  []bool
+	recoverByState    [][]recoverSymbolAction
 	forceRawSpanAll   bool
 	forceRawSpanTable []bool
 	included          []Range
@@ -34,6 +36,11 @@ type Parser struct {
 type smallActionPair struct {
 	sym uint16
 	val uint16
+}
+
+type recoverSymbolAction struct {
+	sym    uint16
+	action ParseAction
 }
 
 type parserScratch struct {
@@ -54,33 +61,35 @@ var parserScratchPool = sync.Pool{
 // ReuseCursorNanos includes reuse-cursor setup and subtree-candidate checks.
 // ReparseNanos includes the remainder of incremental parsing/rebuild work.
 type IncrementalParseProfile struct {
-	ReuseCursorNanos  int64
-	ReparseNanos      int64
-	ReusedSubtrees    uint64
-	ReusedBytes       uint64
-	NewNodesAllocated uint64
-	RecoverSearches   uint64
+	ReuseCursorNanos   int64
+	ReparseNanos       int64
+	ReusedSubtrees     uint64
+	ReusedBytes        uint64
+	NewNodesAllocated  uint64
+	RecoverSearches    uint64
 	RecoverStateChecks uint64
-	RecoverStateSkips uint64
-	RecoverLookups    uint64
-	RecoverHits       uint64
-	MaxStacksSeen     int
-	EntryScratchPeak  uint64
+	RecoverStateSkips  uint64
+	RecoverSymbolSkips uint64
+	RecoverLookups     uint64
+	RecoverHits        uint64
+	MaxStacksSeen      int
+	EntryScratchPeak   uint64
 }
 
 type incrementalParseTiming struct {
-	totalNanos       int64
-	reuseNanos       int64
-	reusedSubtrees   uint64
-	reusedBytes      uint64
-	newNodes         uint64
-	recoverSearches  uint64
+	totalNanos         int64
+	reuseNanos         int64
+	reusedSubtrees     uint64
+	reusedBytes        uint64
+	newNodes           uint64
+	recoverSearches    uint64
 	recoverStateChecks uint64
-	recoverStateSkips uint64
-	recoverLookups   uint64
-	recoverHits      uint64
-	maxStacksSeen    int
-	entryScratchPeak uint64
+	recoverStateSkips  uint64
+	recoverSymbolSkips uint64
+	recoverLookups     uint64
+	recoverHits        uint64
+	maxStacksSeen      int
+	entryScratchPeak   uint64
 }
 
 type parseReuseState struct {
@@ -122,18 +131,19 @@ func (t *incrementalParseTiming) toProfile() IncrementalParseProfile {
 		reparse = 0
 	}
 	return IncrementalParseProfile{
-		ReuseCursorNanos:  t.reuseNanos,
-		ReparseNanos:      reparse,
-		ReusedSubtrees:    t.reusedSubtrees,
-		ReusedBytes:       t.reusedBytes,
-		NewNodesAllocated: t.newNodes,
-		RecoverSearches:   t.recoverSearches,
+		ReuseCursorNanos:   t.reuseNanos,
+		ReparseNanos:       reparse,
+		ReusedSubtrees:     t.reusedSubtrees,
+		ReusedBytes:        t.reusedBytes,
+		NewNodesAllocated:  t.newNodes,
+		RecoverSearches:    t.recoverSearches,
 		RecoverStateChecks: t.recoverStateChecks,
-		RecoverStateSkips: t.recoverStateSkips,
-		RecoverLookups:    t.recoverLookups,
-		RecoverHits:       t.recoverHits,
-		MaxStacksSeen:     t.maxStacksSeen,
-		EntryScratchPeak:  t.entryScratchPeak,
+		RecoverStateSkips:  t.recoverStateSkips,
+		RecoverSymbolSkips: t.recoverSymbolSkips,
+		RecoverLookups:     t.recoverLookups,
+		RecoverHits:        t.recoverHits,
+		MaxStacksSeen:      t.maxStacksSeen,
+		EntryScratchPeak:   t.entryScratchPeak,
 	}
 }
 
@@ -190,29 +200,38 @@ func NewParser(lang *Language) *Parser {
 		if len(lang.SmallParseTableMap) > 0 && len(lang.SmallParseTable) > 0 {
 			p.smallLookup = buildSmallLookup(lang)
 		}
-		p.hasRecoverState = buildStateRecoverTable(lang)
+		p.recoverByState, p.hasRecoverState, p.hasRecoverSymbol = buildRecoverActionsByState(lang)
 	}
 	return p
 }
 
 func buildStateRecoverTable(lang *Language) []bool {
+	_, table, _ := buildRecoverActionsByState(lang)
+	return table
+}
+
+func buildRecoverActionsByState(lang *Language) ([][]recoverSymbolAction, []bool, []bool) {
 	if lang == nil {
-		return nil
+		return nil, nil, nil
 	}
 	if len(lang.ParseActions) == 0 {
-		return nil
+		return nil, nil, nil
 	}
 
+	recoverActions := make([]ParseAction, len(lang.ParseActions))
 	hasRecoverAction := make([]bool, len(lang.ParseActions))
 	anyRecoverAction := false
 	for i := range lang.ParseActions {
-		hasRecoverAction[i] = parseActionEntryHasRecover(&lang.ParseActions[i])
-		if hasRecoverAction[i] {
-			anyRecoverAction = true
+		act, ok := recoverAction(&lang.ParseActions[i])
+		if !ok {
+			continue
 		}
+		recoverActions[i] = act
+		hasRecoverAction[i] = true
+		anyRecoverAction = true
 	}
 	if !anyRecoverAction {
-		return nil
+		return nil, nil, nil
 	}
 
 	stateCount := int(lang.StateCount)
@@ -223,16 +242,44 @@ func buildStateRecoverTable(lang *Language) []bool {
 		stateCount = smallCount
 	}
 	if stateCount <= 0 {
-		return nil
+		return nil, nil, nil
+	}
+	symbolCount := int(lang.SymbolCount)
+	if symbolCount <= 0 {
+		symbolCount = len(lang.SymbolNames)
+	}
+	if symbolCount <= 0 {
+		symbolCount = 64
 	}
 
-	out := make([]bool, stateCount)
+	recoverByState := make([][]recoverSymbolAction, stateCount)
+	hasRecoverSymbol := make([]bool, symbolCount)
+	ensureSymbolCap := func(sym uint16) {
+		idx := int(sym)
+		if idx < len(hasRecoverSymbol) {
+			return
+		}
+		newLen := len(hasRecoverSymbol)
+		if newLen == 0 {
+			newLen = 64
+		}
+		for idx >= newLen {
+			newLen *= 2
+		}
+		expanded := make([]bool, newLen)
+		copy(expanded, hasRecoverSymbol)
+		hasRecoverSymbol = expanded
+	}
 	for state := 0; state < len(lang.ParseTable) && state < stateCount; state++ {
 		row := lang.ParseTable[state]
-		for _, idx := range row {
+		for sym, idx := range row {
 			if int(idx) < len(hasRecoverAction) && hasRecoverAction[idx] {
-				out[state] = true
-				break
+				ensureSymbolCap(uint16(sym))
+				hasRecoverSymbol[sym] = true
+				recoverByState[state] = append(recoverByState[state], recoverSymbolAction{
+					sym:    uint16(sym),
+					action: recoverActions[idx],
+				})
 			}
 		}
 	}
@@ -258,26 +305,47 @@ func buildStateRecoverTable(lang *Language) []bool {
 				sectionValue := table[pos]
 				symbolCount := int(table[pos+1])
 				pos += 2
-				if int(sectionValue) < len(hasRecoverAction) && hasRecoverAction[sectionValue] {
-					out[state] = true
-					break
+				hasRecover := int(sectionValue) < len(hasRecoverAction) && hasRecoverAction[sectionValue]
+				for j := 0; j < symbolCount; j++ {
+					if pos >= len(table) {
+						break
+					}
+					if hasRecover {
+						ensureSymbolCap(table[pos])
+						hasRecoverSymbol[table[pos]] = true
+						recoverByState[state] = append(recoverByState[state], recoverSymbolAction{
+							sym:    table[pos],
+							action: recoverActions[sectionValue],
+						})
+					}
+					pos++
 				}
-				pos += symbolCount
 			}
 		}
 	}
 
+	hasRecoverState := make([]bool, stateCount)
 	anyState := false
-	for i := range out {
-		if out[i] {
+	for i := range recoverByState {
+		if len(recoverByState[i]) > 0 {
+			hasRecoverState[i] = true
 			anyState = true
-			break
 		}
 	}
 	if !anyState {
-		return nil
+		return nil, nil, nil
 	}
-	return out
+	anySymbol := false
+	for i := range hasRecoverSymbol {
+		if hasRecoverSymbol[i] {
+			anySymbol = true
+			break
+		}
+	}
+	if !anySymbol {
+		hasRecoverSymbol = nil
+	}
+	return recoverByState, hasRecoverState, hasRecoverSymbol
 }
 
 func parseActionEntryHasRecover(entry *ParseActionEntry) bool {
@@ -298,6 +366,35 @@ func (p *Parser) stateCanRecover(state StateID) bool {
 	}
 	idx := int(state)
 	return idx >= 0 && idx < len(p.hasRecoverState) && p.hasRecoverState[idx]
+}
+
+func (p *Parser) symbolCanRecover(sym Symbol) bool {
+	if len(p.hasRecoverSymbol) == 0 {
+		return true
+	}
+	idx := int(sym)
+	return idx >= 0 && idx < len(p.hasRecoverSymbol) && p.hasRecoverSymbol[idx]
+}
+
+func (p *Parser) recoverActionForState(state StateID, sym Symbol) (ParseAction, bool) {
+	if len(p.recoverByState) == 0 {
+		return ParseAction{}, false
+	}
+	idx := int(state)
+	if idx < 0 || idx >= len(p.recoverByState) {
+		return ParseAction{}, false
+	}
+	entries := p.recoverByState[idx]
+	if len(entries) == 0 {
+		return ParseAction{}, false
+	}
+	target := uint16(sym)
+	for i := range entries {
+		if entries[i].sym == target {
+			return entries[i].action, true
+		}
+	}
+	return ParseAction{}, false
 }
 
 func buildSmallLookup(lang *Language) [][]smallActionPair {
@@ -2060,6 +2157,12 @@ func (p *Parser) findRecoverActionOnStack(s *glrStack, sym Symbol, timing *incre
 	if timing != nil {
 		timing.recoverSearches++
 	}
+	if !p.symbolCanRecover(sym) {
+		if timing != nil {
+			timing.recoverSymbolSkips++
+		}
+		return 0, ParseAction{}, false
+	}
 
 	if len(s.entries) > 0 {
 		entries := s.entries
@@ -2077,8 +2180,7 @@ func (p *Parser) findRecoverActionOnStack(s *glrStack, sym Symbol, timing *incre
 			if timing != nil {
 				timing.recoverLookups++
 			}
-			action := p.lookupAction(state, sym)
-			if act, ok := recoverAction(action); ok {
+			if act, ok := p.recoverActionForState(state, sym); ok {
 				if timing != nil {
 					timing.recoverHits++
 				}
@@ -2108,8 +2210,7 @@ func (p *Parser) findRecoverActionOnStack(s *glrStack, sym Symbol, timing *incre
 		if timing != nil {
 			timing.recoverLookups++
 		}
-		action := p.lookupAction(state, sym)
-		if act, ok := recoverAction(action); ok {
+		if act, ok := p.recoverActionForState(state, sym); ok {
 			if timing != nil {
 				timing.recoverHits++
 			}

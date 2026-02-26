@@ -136,6 +136,12 @@ func BenchmarkGoParseFullDFA(b *testing.B) {
 	lang := grammars.GoLanguage()
 	parser := gotreesitter.NewParser(lang)
 	src := makeGoBenchmarkSource(benchmarkFuncCount(b))
+	statsEnabled := strings.TrimSpace(os.Getenv("GOT_STATS")) != ""
+	if statsEnabled {
+		gotreesitter.ResetArenaProfile()
+		gotreesitter.EnableArenaProfile(true)
+		defer gotreesitter.EnableArenaProfile(false)
+	}
 
 	b.ReportAllocs()
 	b.SetBytes(int64(len(src)))
@@ -150,6 +156,13 @@ func BenchmarkGoParseFullDFA(b *testing.B) {
 			b.Fatal("parse returned nil root")
 		}
 		tree.Release()
+	}
+	if statsEnabled {
+		a := gotreesitter.ArenaProfileSnapshot()
+		fmt.Printf(
+			"STATS arena_full_acquire=%d arena_full_new=%d arena_inc_acquire=%d arena_inc_new=%d\n",
+			a.FullAcquire, a.FullNew, a.IncrementalAcquire, a.IncrementalNew,
+		)
 	}
 }
 
@@ -219,6 +232,11 @@ func BenchmarkGoParseIncrementalSingleByteEditDFA(b *testing.B) {
 	parser := gotreesitter.NewParser(lang)
 	src := makeGoBenchmarkSource(benchmarkFuncCount(b))
 	statsEnabled := strings.TrimSpace(os.Getenv("GOT_STATS")) != ""
+	if statsEnabled {
+		gotreesitter.ResetArenaProfile()
+		gotreesitter.EnableArenaProfile(true)
+		defer gotreesitter.EnableArenaProfile(false)
+	}
 	var editTotalNS uint64
 	var reuseTotalNS uint64
 	var parseTotalNS uint64
@@ -228,6 +246,7 @@ func BenchmarkGoParseIncrementalSingleByteEditDFA(b *testing.B) {
 	var recoverSearches uint64
 	var recoverStateChecks uint64
 	var recoverStateSkips uint64
+	var recoverSymbolSkips uint64
 	var recoverLookups uint64
 	var recoverHits uint64
 	var entryScratchPeak uint64
@@ -286,6 +305,7 @@ func BenchmarkGoParseIncrementalSingleByteEditDFA(b *testing.B) {
 			recoverSearches += prof.RecoverSearches
 			recoverStateChecks += prof.RecoverStateChecks
 			recoverStateSkips += prof.RecoverStateSkips
+			recoverSymbolSkips += prof.RecoverSymbolSkips
 			recoverLookups += prof.RecoverLookups
 			recoverHits += prof.RecoverHits
 			if prof.EntryScratchPeak > entryScratchPeak {
@@ -308,9 +328,18 @@ func BenchmarkGoParseIncrementalSingleByteEditDFA(b *testing.B) {
 		}
 	}
 	if statsEnabled {
+		a := gotreesitter.ArenaProfileSnapshot()
 		fmt.Printf(
 			"STATS edits=%d edit_ns=%d reuse_ns=%d parse_ns=%d reused_subtrees=%d reused_bytes=%d new_nodes=%d recover_searches=%d recover_state_checks=%d recover_state_skips=%d recover_lookups=%d recover_hits=%d max_stacks=%d\n",
 			b.N, editTotalNS, reuseTotalNS, parseTotalNS, reusedSubtrees, reusedBytes, newNodesAllocated, recoverSearches, recoverStateChecks, recoverStateSkips, recoverLookups, recoverHits, maxStacksSeen,
+		)
+		fmt.Printf(
+			"STATS recover_symbol_skips=%d\n",
+			recoverSymbolSkips,
+		)
+		fmt.Printf(
+			"STATS arena_full_acquire=%d arena_full_new=%d arena_inc_acquire=%d arena_inc_new=%d\n",
+			a.FullAcquire, a.FullNew, a.IncrementalAcquire, a.IncrementalNew,
 		)
 		fmt.Printf(
 			"STATS scratch_peak_entries=%d\n",

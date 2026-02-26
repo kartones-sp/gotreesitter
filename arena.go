@@ -31,6 +31,7 @@ const (
 	// on warm edit/full-parse workloads.
 	maxRetainedIncrementalNodeCap = 1 * 1024 * 1024
 	maxRetainedFullNodeCap        = 2 * 1024 * 1024
+
 )
 
 type arenaClass uint8
@@ -94,16 +95,68 @@ type nodeArenaPool struct {
 	free      []*nodeArena
 }
 
+type ArenaProfile struct {
+	IncrementalAcquire uint64
+	IncrementalNew     uint64
+	FullAcquire        uint64
+	FullNew            uint64
+}
+
+var (
+	arenaProfileEnabled bool
+	arenaProfileData    ArenaProfile
+)
+
+// EnableArenaProfile toggles arena pool counters.
+// This debug hook is not concurrency-safe and is intended for single-threaded
+// benchmark/profiling runs.
+func EnableArenaProfile(enabled bool) {
+	arenaProfileEnabled = enabled
+}
+
+// ResetArenaProfile resets arena pool counters.
+// This debug hook is not concurrency-safe and is intended for single-threaded
+// benchmark/profiling runs.
+func ResetArenaProfile() {
+	arenaProfileData = ArenaProfile{}
+}
+
+// ArenaProfileSnapshot returns current arena pool counters.
+// This debug hook is not concurrency-safe and is intended for single-threaded
+// benchmark/profiling runs.
+func ArenaProfileSnapshot() ArenaProfile {
+	return arenaProfileData
+}
+
 func (p *nodeArenaPool) acquire() *nodeArena {
 	p.mu.Lock()
 	n := len(p.free)
 	if n == 0 {
 		p.mu.Unlock()
-		return newNodeArena(p.class, p.slabBytes)
+		a := newNodeArena(p.class, p.slabBytes)
+		if arenaProfileEnabled {
+			switch p.class {
+			case arenaClassIncremental:
+				arenaProfileData.IncrementalAcquire++
+				arenaProfileData.IncrementalNew++
+			default:
+				arenaProfileData.FullAcquire++
+				arenaProfileData.FullNew++
+			}
+		}
+		return a
 	}
 	a := p.free[n-1]
 	p.free = p.free[:n-1]
 	p.mu.Unlock()
+	if arenaProfileEnabled {
+		switch p.class {
+		case arenaClassIncremental:
+			arenaProfileData.IncrementalAcquire++
+		default:
+			arenaProfileData.FullAcquire++
+		}
+	}
 	return a
 }
 
@@ -240,11 +293,19 @@ func (a *nodeArena) allocNode() *Node {
 	if a == nil {
 		return &Node{}
 	}
+	return a.allocNodeFast()
+}
+
+func (a *nodeArena) allocNodeFast() *Node {
 	if a.used < len(a.nodes) {
 		n := &a.nodes[a.used]
 		a.used++
 		return n
 	}
+	return a.allocNodeSlow()
+}
+
+func (a *nodeArena) allocNodeSlow() *Node {
 	if len(a.nodeSlabs) == 0 {
 		capacity := nodeCapacityForClass(a.class)
 		if capacity < minArenaNodeCap {

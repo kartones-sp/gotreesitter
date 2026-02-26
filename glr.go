@@ -143,15 +143,30 @@ func (s *glrStack) clone() glrStack {
 	if s.gss.head == nil && len(s.entries) > 0 {
 		entries := make([]stackEntry, len(s.entries))
 		copy(entries, s.entries)
-		return glrStack{entries: entries, cacheEntries: s.cacheEntries, byteOffset: s.byteOffset, score: s.score}
+		return glrStack{
+			entries:      entries,
+			cacheEntries: s.cacheEntries,
+			byteOffset:   s.byteOffset,
+			score:        s.score,
+		}
 	}
 	s.ensureGSS(nil)
-	return glrStack{gss: s.gss.clone(), cacheEntries: s.cacheEntries, byteOffset: s.byteOffset, score: s.score}
+	return glrStack{
+		gss:          s.gss.clone(),
+		cacheEntries: s.cacheEntries,
+		byteOffset:   s.byteOffset,
+		score:        s.score,
+	}
 }
 
 func (s *glrStack) cloneWithScratch(scratch *gssScratch) glrStack {
 	s.ensureGSS(scratch)
-	return glrStack{gss: s.gss.clone(), cacheEntries: false, byteOffset: s.byteOffset, score: s.score}
+	return glrStack{
+		gss:          s.gss.clone(),
+		cacheEntries: false,
+		byteOffset:   s.byteOffset,
+		score:        s.score,
+	}
 }
 
 func (s *glrStack) ensureEntries(entryScratch *glrEntryScratch) []stackEntry {

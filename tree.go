@@ -422,9 +422,17 @@ func symbolVisible(lang *Language, sym Symbol) bool {
 
 func newLeafNodeInArena(arena *nodeArena, sym Symbol, named bool, startByte, endByte uint32, startPoint, endPoint Point) *Node {
 	if arena == nil {
-		return NewLeafNode(sym, named, startByte, endByte, startPoint, endPoint)
+		return &Node{
+			symbol:     sym,
+			isNamed:    named,
+			startByte:  startByte,
+			endByte:    endByte,
+			startPoint: startPoint,
+			endPoint:   endPoint,
+			childIndex: -1,
+		}
 	}
-	n := arena.allocNode()
+	n := arena.allocNodeFast()
 	n.symbol = sym
 	n.isNamed = named
 	n.startByte = startByte
@@ -437,7 +445,19 @@ func newLeafNodeInArena(arena *nodeArena, sym Symbol, named bool, startByte, end
 }
 
 func newParentNodeInArena(arena *nodeArena, sym Symbol, named bool, children []*Node, fieldIDs []FieldID, productionID uint16) *Node {
-	return newParentNode(arena, sym, named, children, fieldIDs, productionID)
+	if arena == nil {
+		return newParentNode(nil, sym, named, children, fieldIDs, productionID)
+	}
+	n := arena.allocNodeFast()
+	n.ownerArena = arena
+	n.symbol = sym
+	n.isNamed = named
+	n.children = children
+	n.fieldIDs = fieldIDs
+	n.productionID = productionID
+	n.childIndex = -1
+	populateParentNode(n, children)
+	return n
 }
 
 // Tree holds a complete syntax tree along with its source text and language.

@@ -537,6 +537,20 @@ func TestBuildStateRecoverTableMarksRecoverStates(t *testing.T) {
 	}
 }
 
+func TestBuildRecoverActionsByStateMarksRecoverSymbols(t *testing.T) {
+	lang := buildArithmeticRecoverLanguage()
+	_, _, symbols := buildRecoverActionsByState(lang)
+	if len(symbols) == 0 {
+		t.Fatal("expected recover symbol table to be populated")
+	}
+	if !symbols[3] { // STAR
+		t.Fatal("expected STAR to be marked as recoverable lookahead")
+	}
+	if symbols[1] { // NUMBER
+		t.Fatal("did not expect NUMBER to be marked as recoverable lookahead")
+	}
+}
+
 func TestFindRecoverActionOnStackUsesNearestAncestor(t *testing.T) {
 	lang := buildArithmeticRecoverLanguage()
 	parser := NewParser(lang)
@@ -556,6 +570,18 @@ func TestFindRecoverActionOnStackUsesNearestAncestor(t *testing.T) {
 	}
 	if act.State != 3 {
 		t.Fatalf("recover state = %d, want 3", act.State)
+	}
+}
+
+func TestRecoverActionForStateUsesSymbolSpecificTable(t *testing.T) {
+	lang := buildArithmeticRecoverLanguage()
+	parser := NewParser(lang)
+
+	if _, ok := parser.recoverActionForState(2, Symbol(3)); !ok {
+		t.Fatal("expected recover action for state 2 on STAR")
+	}
+	if _, ok := parser.recoverActionForState(2, Symbol(1)); ok {
+		t.Fatal("did not expect recover action for state 2 on NUMBER")
 	}
 }
 
