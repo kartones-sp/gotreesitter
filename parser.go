@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"unicode/utf8"
 )
@@ -11,13 +12,22 @@ import (
 // Parser reads parse tables from a Language and produces a syntax tree.
 // It supports GLR parsing: when a (state, symbol) pair maps to multiple
 // actions, the parser forks the stack and explores all alternatives in
-// parallel, merging stacks that converge on the same state and picking
-// the highest dynamic-precedence winner for ambiguities.
+// parallel while preserving distinct parse paths. Duplicate stack
+// versions are collapsed and ambiguities are resolved at selection time.
 type Parser struct {
 	language     *Language
 	reuseCursor  reuseCursor
 	reuseScratch reuseScratch
 	reuseMu      sync.Mutex
+	included     []Range
+	denseLimit   int
+	smallBase    int
+	smallLookup  [][]smallActionPair
+}
+
+type smallActionPair struct {
+	sym uint16
+	val uint16
 }
 
 type parserScratch struct {
@@ -39,14 +49,110 @@ func releaseParserScratch(s *parserScratch) {
 	if s == nil {
 		return
 	}
+	if cap(s.merge.result) > 0 {
+		clear(s.merge.result[:cap(s.merge.result)])
+	}
+	if cap(s.merge.keys) > 0 {
+		clear(s.merge.keys[:cap(s.merge.keys)])
+	}
+	if cap(s.merge.alive) > 0 {
+		clear(s.merge.alive[:cap(s.merge.alive)])
+	}
 	s.merge.result = s.merge.result[:0]
+	s.merge.keys = s.merge.keys[:0]
+	s.merge.alive = s.merge.alive[:0]
 	s.entries.reset()
 	parserScratchPool.Put(s)
 }
 
 // NewParser creates a new Parser for the given language.
 func NewParser(lang *Language) *Parser {
-	return &Parser{language: lang}
+	p := &Parser{language: lang}
+	if lang != nil {
+		if lang.LargeStateCount > 0 {
+			p.denseLimit = int(lang.LargeStateCount)
+		} else {
+			p.denseLimit = len(lang.ParseTable)
+		}
+		p.smallBase = int(lang.LargeStateCount)
+		if len(lang.SmallParseTableMap) > 0 && len(lang.SmallParseTable) > 0 {
+			p.smallLookup = buildSmallLookup(lang)
+		}
+	}
+	return p
+}
+
+func buildSmallLookup(lang *Language) [][]smallActionPair {
+	out := make([][]smallActionPair, len(lang.SmallParseTableMap))
+	table := lang.SmallParseTable
+	for smallIdx, offset := range lang.SmallParseTableMap {
+		pos := int(offset)
+		if pos >= len(table) {
+			continue
+		}
+		groupCount := table[pos]
+		pos++
+		total := 0
+		countPos := pos
+		for i := uint16(0); i < groupCount; i++ {
+			if countPos+1 >= len(table) {
+				total = 0
+				break
+			}
+			symbolCount := int(table[countPos+1])
+			total += symbolCount
+			countPos += 2 + symbolCount
+		}
+		if total == 0 {
+			continue
+		}
+
+		pairs := make([]smallActionPair, 0, total)
+		for i := uint16(0); i < groupCount; i++ {
+			if pos+1 >= len(table) {
+				break
+			}
+			val := table[pos]
+			symbolCount := table[pos+1]
+			pos += 2
+			for j := uint16(0); j < symbolCount; j++ {
+				if pos >= len(table) {
+					break
+				}
+				pairs = append(pairs, smallActionPair{sym: table[pos], val: val})
+				pos++
+			}
+		}
+		sort.Slice(pairs, func(i, j int) bool { return pairs[i].sym < pairs[j].sym })
+		out[smallIdx] = pairs
+	}
+	return out
+}
+
+// SetIncludedRanges configures parser include ranges.
+// Tokens outside these ranges are skipped.
+func (p *Parser) SetIncludedRanges(ranges []Range) {
+	if p == nil {
+		return
+	}
+	p.included = normalizeIncludedRanges(ranges)
+}
+
+// IncludedRanges returns a copy of the configured include ranges.
+func (p *Parser) IncludedRanges() []Range {
+	if p == nil || len(p.included) == 0 {
+		return nil
+	}
+	out := make([]Range, len(p.included))
+	copy(out, p.included)
+	return out
+}
+
+func (p *Parser) wrapIncludedRanges(ts TokenSource) TokenSource {
+	if p == nil || len(p.included) == 0 || ts == nil {
+		return ts
+	}
+	return newIncludedRangeTokenSource(ts, p.included)
 }
 
 // TokenSource provides tokens to the parser. This interface abstracts over
@@ -73,6 +179,10 @@ type ByteSkippableTokenSource interface {
 type PointSkippableTokenSource interface {
 	ByteSkippableTokenSource
 	SkipToByteWithPoint(offset uint32, pt Point) Token
+}
+
+type parserStateTokenSource interface {
+	SetParserState(state StateID)
 }
 
 // stackEntry is a single entry on the parser's LR stack, pairing a parser
@@ -105,7 +215,7 @@ func (p *Parser) Parse(source []byte) (*Tree, error) {
 	if p.language.ExternalScanner != nil {
 		ts.externalPayload = p.language.ExternalScanner.Create()
 	}
-	return p.parseInternal(source, ts, nil, nil, arenaClassFull), nil
+	return p.parseInternal(source, p.wrapIncludedRanges(ts), nil, nil, arenaClassFull), nil
 }
 
 // ParseWithTokenSource parses source using a custom token source.
@@ -115,7 +225,7 @@ func (p *Parser) ParseWithTokenSource(source []byte, ts TokenSource) (*Tree, err
 	if err := p.checkLanguageCompatible(); err != nil {
 		return nil, err
 	}
-	return p.parseInternal(source, ts, nil, nil, arenaClassFull), nil
+	return p.parseInternal(source, p.wrapIncludedRanges(ts), nil, nil, arenaClassFull), nil
 }
 
 // ParseIncremental re-parses source after edits were applied to oldTree.
@@ -137,7 +247,7 @@ func (p *Parser) ParseIncremental(source []byte, oldTree *Tree) (*Tree, error) {
 	if p.language.ExternalScanner != nil {
 		ts.externalPayload = p.language.ExternalScanner.Create()
 	}
-	return p.parseIncrementalInternal(source, oldTree, ts), nil
+	return p.parseIncrementalInternal(source, oldTree, p.wrapIncludedRanges(ts)), nil
 }
 
 // ParseIncrementalWithTokenSource is like ParseIncremental but uses a custom
@@ -146,7 +256,7 @@ func (p *Parser) ParseIncrementalWithTokenSource(source []byte, oldTree *Tree, t
 	if err := p.checkLanguageCompatible(); err != nil {
 		return nil, err
 	}
-	return p.parseIncrementalInternal(source, oldTree, ts), nil
+	return p.parseIncrementalInternal(source, oldTree, p.wrapIncludedRanges(ts)), nil
 }
 
 // ErrNoLanguage is returned when a Parser has no language configured.
@@ -179,6 +289,16 @@ func (p *Parser) parseIncrementalInternal(source []byte, oldTree *Tree, ts Token
 		len(oldTree.edits) == 0 &&
 		bytes.Equal(oldTree.source, source) {
 		return oldTree
+	}
+
+	// Reuse is currently safe only for DFA token sources without external
+	// scanner state. All other backends parse incrementally with fresh-parse
+	// semantics to preserve correctness.
+	if _, isDFA := ts.(*dfaTokenSource); !isDFA {
+		return p.parseInternal(source, ts, nil, nil, arenaClassFull)
+	}
+	if p.language != nil && p.language.ExternalScanner != nil {
+		return p.parseInternal(source, ts, nil, nil, arenaClassFull)
 	}
 
 	p.reuseMu.Lock()
@@ -241,6 +361,10 @@ func (d *dfaTokenSource) Next() Token {
 		println("  DFA tok", tok.Symbol, name, tok.StartByte, tok.EndByte, tok.Text, "state=", d.state, "lexState=", lexState)
 	}
 	return tok
+}
+
+func (d *dfaTokenSource) SetParserState(state StateID) {
+	d.state = state
 }
 
 func (d *dfaTokenSource) SkipToByte(offset uint32) Token {
@@ -669,6 +793,21 @@ func parseNodeLimit(sourceLen int) int {
 	return max(50_000, sourceLen*10)
 }
 
+func parseFullArenaNodeCapacity(sourceLen int) int {
+	base := nodeCapacityForClass(arenaClassFull)
+	if sourceLen <= 0 {
+		return base
+	}
+	estimate := sourceLen / 2
+	if sourceLen <= 64*1024 {
+		estimate = sourceLen + sourceLen/2
+	}
+	if estimate < base {
+		return base
+	}
+	return estimate
+}
+
 func parseErrorTree(source []byte, lang *Language) *Tree {
 	end := Point{}
 	for i := 0; i < len(source); {
@@ -709,8 +848,8 @@ func isWhitespaceOnlySource(source []byte) bool {
 // action per table entry), there is exactly one stack and the algorithm
 // reduces to standard LR parsing. When multiple actions exist for a
 // (state, symbol) pair, the parser forks: one stack per alternative.
-// Stacks that error out are dropped. Stacks that converge to the same
-// top state are merged, keeping the highest dynamic-precedence version.
+// Stacks that error out are dropped. Only duplicate stack versions are
+// merged; distinct alternatives are preserved.
 func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor, oldTree *Tree, arenaClass arenaClass) *Tree {
 	if closer, ok := ts.(interface{ Close() }); ok {
 		defer closer.Close()
@@ -719,6 +858,9 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 	defer releaseParserScratch(scratch)
 
 	arena := acquireNodeArena(arenaClass)
+	if arenaClass == arenaClassFull {
+		arena.ensureNodeCapacity(parseFullArenaNodeCapacity(len(source)))
+	}
 	reusedAny := false
 
 	finalize := func(stacks []glrStack) *Tree {
@@ -740,7 +882,7 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 	var consecutiveReduces int
 
 	for iter := 0; iter < maxIter; iter++ {
-		// Prune dead stacks and merge stacks with identical top states.
+		// Prune dead stacks and collapse only truly duplicate stack versions.
 		stacks = mergeStacksWithScratch(stacks, &scratch.merge)
 		if len(stacks) == 0 {
 			arena.Release()
@@ -748,10 +890,20 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 		}
 
 		// Cap the number of parallel stacks to prevent combinatorial explosion.
+		// Keep the most promising stacks instead of truncating by insertion
+		// order, which can discard viable parses on highly-ambiguous inputs.
 		const maxStacks = 64
 		if len(stacks) > maxStacks {
+			sort.SliceStable(stacks, func(i, j int) bool {
+				return stackPreferredForRetention(stacks[i], stacks[j])
+			})
 			stacks = stacks[:maxStacks]
 		}
+
+		// Keep the most promising stack in slot 0 because several parser
+		// heuristics (lex-mode selection, reduce-loop detection, depth cap)
+		// currently key off the primary stack.
+		p.promotePrimaryStack(stacks)
 
 		// Safety: if the primary stack has grown beyond the depth cap,
 		// or we've allocated too many nodes, return what we have.
@@ -760,12 +912,17 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 		}
 
 		// Use the primary (first) stack's state for DFA lex mode selection.
-		if dts, ok := ts.(*dfaTokenSource); ok {
-			dts.state = stacks[0].top().state
+		if stateful, ok := ts.(parserStateTokenSource); ok {
+			stateful.SetParserState(stacks[0].top().state)
 		}
 
 		if needToken {
 			tok = ts.Next()
+			// Clear per-stack shifted flags so all stacks process the
+			// new token.
+			for si := range stacks {
+				stacks[si].shifted = false
+			}
 		}
 
 		// Incremental parsing fast-path: when there is a single active stack,
@@ -785,18 +942,23 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 		numStacks := len(stacks)
 		anyReduced := false
 
+		parseActions := p.language.ParseActions
 		for si := 0; si < numStacks; si++ {
 			s := &stacks[si]
-			if s.dead {
+			if s.dead || s.shifted {
 				continue
 			}
 
 			currentState := s.top().state
-			action := p.lookupAction(currentState, tok.Symbol)
+			actionIdx := p.lookupActionIndex(currentState, tok.Symbol)
+			var actions []ParseAction
+			if actionIdx != 0 && int(actionIdx) < len(parseActions) {
+				actions = parseActions[actionIdx].Actions
+			}
 
 			// --- Extra token handling (comments, whitespace) ---
-			if action != nil && len(action.Actions) > 0 &&
-				action.Actions[0].Type == ParseActionShift && action.Actions[0].Extra {
+			if len(actions) > 0 &&
+				actions[0].Type == ParseActionShift && actions[0].Extra {
 				named := p.isNamedSymbol(tok.Symbol)
 				leaf := newLeafNodeInArena(arena, tok.Symbol, named,
 					tok.StartByte, tok.EndByte, tok.StartPoint, tok.EndPoint)
@@ -809,7 +971,7 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 			}
 
 			// --- No action: error handling ---
-			if action == nil || len(action.Actions) == 0 {
+			if len(actions) == 0 {
 				if tok.Symbol == 0 {
 					if tok.StartByte == tok.EndByte {
 						// True EOF. If this is the only stack, return result.
@@ -858,18 +1020,18 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 			// --- GLR: fork for multiple actions ---
 			// For single-action entries (the common case), no fork occurs.
 			// For multi-action entries, clone the stack for each alternative.
-			actions := action.Actions
 			if len(actions) > 1 {
-				// Save state before applying any action.
-				saved := s.cloneWithScratch(&scratch.entries)
-				// Apply first action to the original stack.
-				p.applyAction(s, actions[0], tok, &anyReduced, &nodeCount, arena, &scratch.entries)
-				// Clone for each additional action.
+				// Copy the current stack value before appending forks.
+				// Appending can reallocate `stacks`, which would invalidate `s`.
+				base := *s
 				for ai := 1; ai < len(actions); ai++ {
-					fork := saved.cloneWithScratch(&scratch.entries)
+					fork := base.cloneWithScratch(&scratch.entries)
 					p.applyAction(&fork, actions[ai], tok, &anyReduced, &nodeCount, arena, &scratch.entries)
 					stacks = append(stacks, fork)
 				}
+				// Re-acquire the pointer after possible reallocation.
+				s = &stacks[si]
+				p.applyAction(s, actions[0], tok, &anyReduced, &nodeCount, arena, &scratch.entries)
 			} else {
 				p.applyAction(s, actions[0], tok, &anyReduced, &nodeCount, arena, &scratch.entries)
 			}
@@ -913,6 +1075,62 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 	return finalize(stacks)
 }
 
+func (p *Parser) promotePrimaryStack(stacks []glrStack) {
+	if len(stacks) <= 1 {
+		return
+	}
+	best := 0
+	for i := 1; i < len(stacks); i++ {
+		if stacks[i].dead && !stacks[best].dead {
+			continue
+		}
+		if !stacks[i].dead && stacks[best].dead {
+			best = i
+			continue
+		}
+		if stacks[i].accepted && !stacks[best].accepted {
+			best = i
+			continue
+		}
+		if !stacks[i].shifted && stacks[best].shifted {
+			best = i
+			continue
+		}
+		if stacks[i].score > stacks[best].score {
+			best = i
+			continue
+		}
+		if stacks[i].score == stacks[best].score && len(stacks[i].entries) > len(stacks[best].entries) {
+			best = i
+		}
+	}
+	if best != 0 {
+		stacks[0], stacks[best] = stacks[best], stacks[0]
+	}
+}
+
+func stackPreferredForRetention(a, b glrStack) bool {
+	if a.accepted != b.accepted {
+		return a.accepted
+	}
+	if a.dead != b.dead {
+		return !a.dead
+	}
+	if pa, pb := stackByteOffset(a.entries), stackByteOffset(b.entries); pa != pb {
+		return pa > pb
+	}
+	if a.score != b.score {
+		return a.score > b.score
+	}
+	if len(a.entries) != len(b.entries) {
+		return len(a.entries) > len(b.entries)
+	}
+	if a.shifted != b.shifted {
+		return !a.shifted && b.shifted
+	}
+	return false
+}
+
 // applyAction applies a single parse action to a GLR stack.
 func (p *Parser) applyAction(s *glrStack, act ParseAction, tok Token, anyReduced *bool, nodeCount *int, arena *nodeArena, entryScratch *glrEntryScratch) {
 	switch act.Type {
@@ -923,6 +1141,7 @@ func (p *Parser) applyAction(s *glrStack, act ParseAction, tok Token, anyReduced
 		leaf.isExtra = act.Extra
 		leaf.parseState = act.State
 		s.push(act.State, leaf, entryScratch)
+		s.shifted = true
 		*nodeCount++
 
 	case ParseActionReduce:
@@ -948,7 +1167,24 @@ func (p *Parser) applyAction(s *glrStack, act ParseAction, tok Token, anyReduced
 
 		// actualEntryCount includes extras interleaved between grammar symbols.
 		actualEntryCount := len(s.entries) - start
+		reducedEntryCount := actualEntryCount
+		trailingExtraCount := 0
+		for i := actualEntryCount - 1; i >= 0; i-- {
+			n := s.entries[start+i].node
+			if n == nil || !n.isExtra {
+				break
+			}
+			trailingExtraCount++
+			reducedEntryCount--
+		}
 		topState := s.entries[start-1].state
+
+		lang := p.language
+		symbolMeta := lang.SymbolMetadata
+		var aliasSeq []Symbol
+		if pid := int(act.ProductionID); pid >= 0 && pid < len(lang.AliasSequences) {
+			aliasSeq = lang.AliasSequences[pid]
+		}
 
 		// Preserve raw span from reduced children while excluding pure extra
 		// padding, so parent ranges match the C runtime.
@@ -957,25 +1193,27 @@ func (p *Parser) applyAction(s *glrStack, act ParseAction, tok Token, anyReduced
 		var rawStartPoint, rawEndPoint Point
 		rawHasStart := false
 		rawHasEnd := false
-		if actualEntryCount > 0 {
-			for i := 0; i < actualEntryCount; i++ {
-				if b, pt, ok := spanStartExcludingExtra(p.language, s.entries[start+i].node); ok {
-					rawStartByte = b
-					rawStartPoint = pt
+		if reducedEntryCount > 0 {
+			for i := 0; i < reducedEntryCount; i++ {
+				n := s.entries[start+i].node
+				if n != nil && !n.isExtra {
+					rawStartByte = n.startByte
+					rawStartPoint = n.startPoint
 					rawHasStart = true
 					break
 				}
 			}
-			for i := actualEntryCount - 1; i >= 0; i-- {
-				if b, pt, ok := spanEndExcludingExtra(p.language, s.entries[start+i].node); ok {
-					rawEndByte = b
-					rawEndPoint = pt
+			for i := reducedEntryCount - 1; i >= 0; i-- {
+				n := s.entries[start+i].node
+				if n != nil && !n.isExtra {
+					rawEndByte = n.endByte
+					rawEndPoint = n.endPoint
 					rawHasEnd = true
 					break
 				}
 			}
 			firstRaw := s.entries[start].node
-			lastRaw := s.entries[start+actualEntryCount-1].node
+			lastRaw := s.entries[start+reducedEntryCount-1].node
 			if !rawHasStart && firstRaw != nil {
 				rawStartByte = firstRaw.startByte
 				rawStartPoint = firstRaw.startPoint
@@ -990,16 +1228,25 @@ func (p *Parser) applyAction(s *glrStack, act ParseAction, tok Token, anyReduced
 		// storage and avoid per-reduce heap allocations.
 		normalizedCount := 0
 		structuralChildIndex := 0
-		for i := 0; i < actualEntryCount; i++ {
+		for i := 0; i < reducedEntryCount; i++ {
 			n := s.entries[start+i].node
+			if n == nil {
+				continue
+			}
 			effectiveSymbol := n.symbol
 			if !n.isExtra {
-				if alias := p.aliasSymbolForChild(act.ProductionID, structuralChildIndex); alias != 0 {
-					effectiveSymbol = alias
+				if structuralChildIndex < len(aliasSeq) {
+					if alias := aliasSeq[structuralChildIndex]; alias != 0 {
+						effectiveSymbol = alias
+					}
 				}
 				structuralChildIndex++
 			}
-			if symbolVisible(p.language, effectiveSymbol) {
+			visible := true
+			if idx := int(effectiveSymbol); idx < len(symbolMeta) {
+				visible = symbolMeta[effectiveSymbol].Visible
+			}
+			if visible {
 				normalizedCount++
 			} else {
 				normalizedCount += len(n.children)
@@ -1007,35 +1254,37 @@ func (p *Parser) applyAction(s *glrStack, act ParseAction, tok Token, anyReduced
 		}
 
 		rawFieldIDs := p.buildFieldIDs(childCount, act.ProductionID, arena)
-		hasFields := false
-		for _, fid := range rawFieldIDs {
-			if fid != 0 {
-				hasFields = true
-				break
-			}
-		}
-
 		children := arena.allocNodeSlice(normalizedCount)
 		var fieldIDs []FieldID
-		if hasFields {
+		if rawFieldIDs != nil {
 			fieldIDs = arena.allocFieldIDSlice(normalizedCount)
 		}
 
 		out := 0
 		structuralChildIndex = 0
-		for i := 0; i < actualEntryCount; i++ {
+		for i := 0; i < reducedEntryCount; i++ {
 			n := s.entries[start+i].node
+			if n == nil {
+				continue
+			}
 			var fid FieldID
 			if !n.isExtra {
 				if structuralChildIndex < len(rawFieldIDs) {
 					fid = rawFieldIDs[structuralChildIndex]
 				}
-				if alias := p.aliasSymbolForChild(act.ProductionID, structuralChildIndex); alias != 0 {
-					n = aliasedNodeInArena(arena, p.language, n, alias)
+				if structuralChildIndex < len(aliasSeq) {
+					if alias := aliasSeq[structuralChildIndex]; alias != 0 {
+						n = aliasedNodeInArena(arena, lang, n, alias)
+					}
 				}
 				structuralChildIndex++
 			}
-			if symbolVisible(p.language, n.symbol) {
+
+			visible := true
+			if idx := int(n.symbol); idx < len(symbolMeta) {
+				visible = symbolMeta[n.symbol].Visible
+			}
+			if visible {
 				children[out] = n
 				if fieldIDs != nil {
 					fieldIDs[out] = fid
@@ -1044,25 +1293,40 @@ func (p *Parser) applyAction(s *glrStack, act ParseAction, tok Token, anyReduced
 				continue
 			}
 
-			for j, child := range n.children {
-				children[out] = child
-				if fieldIDs != nil {
-					if j == 0 {
-						fieldIDs[out] = fid
-					} else {
-						fieldIDs[out] = 0
-					}
-				}
-				out++
+			kids := n.children
+			if len(kids) == 0 {
+				continue
+			}
+			copy(children[out:], kids)
+			if fieldIDs != nil {
+				fieldIDs[out] = fid
+			}
+			out += len(kids)
+		}
+		if out != len(children) {
+			children = children[:out]
+			if fieldIDs != nil {
+				fieldIDs = fieldIDs[:out]
 			}
 		}
+
+		entriesBeforePop := s.entries
+		trailingStart := start + reducedEntryCount
+		trailingEnd := start + actualEntryCount
 
 		// Pop all reduced entries in one step after collection.
 		s.entries = s.entries[:start]
 
 		named := p.isNamedSymbol(act.Symbol)
 		parent := newParentNodeInArena(arena, act.Symbol, named, children, fieldIDs, act.ProductionID)
-		if actualEntryCount > 0 {
+		shouldUseRawSpan := len(children) == 0
+		if !shouldUseRawSpan && lang != nil && lang.Name == "yaml" {
+			shouldUseRawSpan = true
+		}
+		if !shouldUseRawSpan && int(act.Symbol) < len(lang.SymbolNames) && lang.SymbolNames[act.Symbol] == "statement_list" {
+			shouldUseRawSpan = true
+		}
+		if shouldUseRawSpan && reducedEntryCount > 0 {
 			parent.startByte = rawStartByte
 			parent.endByte = rawEndByte
 			parent.startPoint = rawStartPoint
@@ -1077,6 +1341,14 @@ func (p *Parser) applyAction(s *glrStack, act ParseAction, tok Token, anyReduced
 		}
 		parent.parseState = targetState
 		s.push(targetState, parent, entryScratch)
+		for i := trailingStart; i < trailingEnd; i++ {
+			extra := entriesBeforePop[i].node
+			if extra == nil {
+				continue
+			}
+			extra.parseState = targetState
+			s.push(targetState, extra, entryScratch)
+		}
 
 		s.score += int(act.DynamicPrecedence)
 		*anyReduced = true
@@ -1168,29 +1440,6 @@ func aliasedNodeInArena(arena *nodeArena, lang *Language, n *Node, alias Symbol)
 	return cloned
 }
 
-func spanStartExcludingExtra(_ *Language, n *Node) (uint32, Point, bool) {
-	if n == nil {
-		return 0, Point{}, false
-	}
-	if n.isExtra {
-		return 0, Point{}, false
-	}
-	// All non-extra nodes contribute their range to the parent.
-	// Hidden (anonymous) terminals and parent nodes with already-computed
-	// ranges are all valid span contributors.  Only extras are excluded.
-	return n.startByte, n.startPoint, true
-}
-
-func spanEndExcludingExtra(_ *Language, n *Node) (uint32, Point, bool) {
-	if n == nil {
-		return 0, Point{}, false
-	}
-	if n.isExtra {
-		return 0, Point{}, false
-	}
-	return n.endByte, n.endPoint, true
-}
-
 // buildFieldIDs creates the field ID slice for a reduce action.
 func (p *Parser) buildFieldIDs(childCount int, productionID uint16, arena *nodeArena) []FieldID {
 	if childCount <= 0 || len(p.language.FieldMapEntries) == 0 {
@@ -1277,14 +1526,7 @@ func (p *Parser) lookupAction(state StateID, sym Symbol) *ParseActionEntry {
 // lookupActionIndex returns the parse action index for (state, symbol).
 // Returns 0 (the error/no-action entry) if not found.
 func (p *Parser) lookupActionIndex(state StateID, sym Symbol) uint16 {
-	useDense := false
-	if p.language.LargeStateCount > 0 {
-		useDense = uint32(state) < p.language.LargeStateCount
-	} else if len(p.language.ParseTable) > 0 {
-		useDense = int(state) < len(p.language.ParseTable)
-	}
-
-	if useDense {
+	if int(state) < p.denseLimit {
 		if int(state) < len(p.language.ParseTable) {
 			row := p.language.ParseTable[state]
 			if int(sym) < len(row) {
@@ -1295,9 +1537,39 @@ func (p *Parser) lookupActionIndex(state StateID, sym Symbol) uint16 {
 	}
 
 	// Small (compressed sparse) table lookup.
-	smallIdx := int(state) - int(p.language.LargeStateCount)
+	smallIdx := int(state) - p.smallBase
 	if smallIdx < 0 || smallIdx >= len(p.language.SmallParseTableMap) {
 		return 0
+	}
+	if smallIdx < len(p.smallLookup) {
+		pairs := p.smallLookup[smallIdx]
+		if len(pairs) > 0 {
+			target := uint16(sym)
+			if len(pairs) <= 8 {
+				for i := 0; i < len(pairs); i++ {
+					if pairs[i].sym == target {
+						return pairs[i].val
+					}
+					if pairs[i].sym > target {
+						return 0
+					}
+				}
+				return 0
+			}
+			lo, hi := 0, len(pairs)
+			for lo < hi {
+				mid := int(uint(lo+hi) >> 1)
+				if pairs[mid].sym < target {
+					lo = mid + 1
+				} else {
+					hi = mid
+				}
+			}
+			if lo < len(pairs) && pairs[lo].sym == target {
+				return pairs[lo].val
+			}
+			return 0
+		}
 	}
 	offset := p.language.SmallParseTableMap[smallIdx]
 	table := p.language.SmallParseTable
@@ -1419,7 +1691,11 @@ func (p *Parser) buildResult(stack []stackEntry, source []byte, arena *nodeArena
 	var extras []*Node
 	for _, n := range nodes {
 		if n.isExtra {
-			extras = append(extras, n)
+			// Ignore invisible extras in final-root recovery; they should not
+			// force an error wrapper or inflate root child counts.
+			if p != nil && p.language != nil && int(n.symbol) < len(p.language.SymbolMetadata) && p.language.SymbolMetadata[n.symbol].Visible {
+				extras = append(extras, n)
+			}
 		} else {
 			if realRoot != nil {
 				realRoot = nil // more than one non-extra → genuine error
@@ -1428,44 +1704,50 @@ func (p *Parser) buildResult(stack []stackEntry, source []byte, arena *nodeArena
 			realRoot = n
 		}
 	}
-	if realRoot != nil && len(extras) > 0 {
-		// Fold extras into the real root as leading/trailing children.
-		merged := make([]*Node, 0, len(extras)+len(realRoot.children))
-		leadingCount := 0
-		for _, e := range extras {
-			if e.startByte <= realRoot.startByte {
-				merged = append(merged, e)
-				leadingCount++
+	if realRoot != nil {
+		if len(extras) > 0 {
+			// Fold visible extras into the real root as leading/trailing children.
+			merged := make([]*Node, 0, len(extras)+len(realRoot.children))
+			leadingCount := 0
+			for _, e := range extras {
+				if e.startByte <= realRoot.startByte {
+					merged = append(merged, e)
+					leadingCount++
+				}
 			}
-		}
-		merged = append(merged, realRoot.children...)
-		for _, e := range extras {
-			if e.startByte > realRoot.startByte {
-				merged = append(merged, e)
+			merged = append(merged, realRoot.children...)
+			for _, e := range extras {
+				if e.startByte > realRoot.startByte {
+					merged = append(merged, e)
+				}
 			}
-		}
-		if arena != nil {
-			out := arena.allocNodeSlice(len(merged))
-			copy(out, merged)
-			merged = out
-		}
-		realRoot.children = merged
-		// Keep fieldIDs aligned with children: extras have no field (0).
-		if len(realRoot.fieldIDs) > 0 {
-			trailingCount := len(extras) - leadingCount
-			padded := make([]FieldID, leadingCount+len(realRoot.fieldIDs)+trailingCount)
-			copy(padded[leadingCount:], realRoot.fieldIDs)
-			realRoot.fieldIDs = padded
-		}
-		// Extend root range to cover the extras.
-		for _, e := range extras {
-			if e.startByte < realRoot.startByte {
-				realRoot.startByte = e.startByte
-				realRoot.startPoint = e.startPoint
+			if arena != nil {
+				out := arena.allocNodeSlice(len(merged))
+				copy(out, merged)
+				merged = out
 			}
-			if e.endByte > realRoot.endByte {
-				realRoot.endByte = e.endByte
-				realRoot.endPoint = e.endPoint
+			realRoot.children = merged
+			// Keep fieldIDs aligned with children: extras have no field (0).
+			if len(realRoot.fieldIDs) > 0 {
+				trailingCount := len(extras) - leadingCount
+				padded := make([]FieldID, leadingCount+len(realRoot.fieldIDs)+trailingCount)
+				copy(padded[leadingCount:], realRoot.fieldIDs)
+				realRoot.fieldIDs = padded
+			}
+			// Update parent pointers for folded extras.
+			for _, e := range extras {
+				e.parent = realRoot
+			}
+			// Extend root range to cover the extras.
+			for _, e := range extras {
+				if e.startByte < realRoot.startByte {
+					realRoot.startByte = e.startByte
+					realRoot.startPoint = e.startPoint
+				}
+				if e.endByte > realRoot.endByte {
+					realRoot.endByte = e.endByte
+					realRoot.endPoint = e.endPoint
+				}
 			}
 		}
 		if !hasExpectedRoot || realRoot.symbol == expectedRootSymbol {
