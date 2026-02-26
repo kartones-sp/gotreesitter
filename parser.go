@@ -31,9 +31,10 @@ type smallActionPair struct {
 }
 
 type parserScratch struct {
-	merge   glrMergeScratch
-	entries glrEntryScratch
-	gss     gssScratch
+	merge      glrMergeScratch
+	entries    glrEntryScratch
+	gss        gssScratch
+	tmpEntries []stackEntry
 }
 
 const maxParserScratchPoolSize = 64
@@ -68,6 +69,15 @@ func releaseParserScratch(s *parserScratch) {
 	}
 	s.merge.result = s.merge.result[:0]
 	s.merge.keys = s.merge.keys[:0]
+	if cap(s.tmpEntries) > 0 {
+		buf := s.tmpEntries[:cap(s.tmpEntries)]
+		clear(buf)
+		if cap(buf) > maxRetainedStackEntryCap {
+			s.tmpEntries = nil
+		} else {
+			s.tmpEntries = buf[:0]
+		}
+	}
 	s.entries.reset()
 	s.gss.reset()
 	parserScratchMu.Lock()
@@ -978,6 +988,17 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 		// heuristics (lex-mode selection, reduce-loop detection, depth cap)
 		// currently key off the primary stack.
 		p.promotePrimaryStack(stacks)
+		const maxCachedStacks = 8
+		for i := range stacks {
+			if i < maxCachedStacks {
+				stacks[i].cacheEntries = true
+				continue
+			}
+			stacks[i].cacheEntries = false
+			if stacks[i].gss.head != nil {
+				stacks[i].entries = nil
+			}
+		}
 
 		// Safety: if the primary stack has grown beyond the depth cap,
 		// or we've allocated too many nodes, return what we have.
@@ -1064,12 +1085,12 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 
 				// Try grammar-directed recovery by searching the stack for
 				// the nearest state that can recover on this lookahead.
-				if depth, recoverAct, ok := p.findRecoverActionOnStack(s, tok.Symbol, &scratch.entries); ok {
+				if depth, recoverAct, ok := p.findRecoverActionOnStack(s, tok.Symbol, &scratch.tmpEntries); ok {
 					if !s.truncate(depth + 1) {
 						s.dead = true
 						continue
 					}
-					p.applyAction(s, recoverAct, tok, &anyReduced, &nodeCount, arena, &scratch.entries, &scratch.gss)
+					p.applyAction(s, recoverAct, tok, &anyReduced, &nodeCount, arena, &scratch.entries, &scratch.gss, &scratch.tmpEntries)
 					needToken = true
 					continue
 				}
@@ -1103,7 +1124,7 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 				// to keep parsing bounded.
 				const maxForkCloneDepth = 4 * 1024
 				if s.depth() > maxForkCloneDepth {
-					p.applyAction(s, actions[0], tok, &anyReduced, &nodeCount, arena, &scratch.entries, &scratch.gss)
+					p.applyAction(s, actions[0], tok, &anyReduced, &nodeCount, arena, &scratch.entries, &scratch.gss, &scratch.tmpEntries)
 					continue
 				}
 				// Copy the current stack value before appending forks.
@@ -1111,14 +1132,14 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 				base := *s
 				for ai := 1; ai < len(actions); ai++ {
 					fork := base.cloneWithScratch(&scratch.gss)
-					p.applyAction(&fork, actions[ai], tok, &anyReduced, &nodeCount, arena, &scratch.entries, &scratch.gss)
+					p.applyAction(&fork, actions[ai], tok, &anyReduced, &nodeCount, arena, &scratch.entries, &scratch.gss, &scratch.tmpEntries)
 					stacks = append(stacks, fork)
 				}
 				// Re-acquire the pointer after possible reallocation.
 				s = &stacks[si]
-				p.applyAction(s, actions[0], tok, &anyReduced, &nodeCount, arena, &scratch.entries, &scratch.gss)
+				p.applyAction(s, actions[0], tok, &anyReduced, &nodeCount, arena, &scratch.entries, &scratch.gss, &scratch.tmpEntries)
 			} else {
-				p.applyAction(s, actions[0], tok, &anyReduced, &nodeCount, arena, &scratch.entries, &scratch.gss)
+				p.applyAction(s, actions[0], tok, &anyReduced, &nodeCount, arena, &scratch.entries, &scratch.gss, &scratch.tmpEntries)
 			}
 		}
 
@@ -1217,7 +1238,7 @@ func stackPreferredForRetention(a, b glrStack) bool {
 }
 
 // applyAction applies a single parse action to a GLR stack.
-func (p *Parser) applyAction(s *glrStack, act ParseAction, tok Token, anyReduced *bool, nodeCount *int, arena *nodeArena, entryScratch *glrEntryScratch, gssScratch *gssScratch) {
+func (p *Parser) applyAction(s *glrStack, act ParseAction, tok Token, anyReduced *bool, nodeCount *int, arena *nodeArena, entryScratch *glrEntryScratch, gssScratch *gssScratch, tmpEntries *[]stackEntry) {
 	switch act.Type {
 	case ParseActionShift:
 		named := p.isNamedSymbol(tok.Symbol)
@@ -1230,7 +1251,24 @@ func (p *Parser) applyAction(s *glrStack, act ParseAction, tok Token, anyReduced
 		*nodeCount++
 
 	case ParseActionReduce:
-		entries := s.ensureEntries(entryScratch)
+		entries := s.entries
+		borrowed := false
+		if entries == nil {
+			if s.cacheEntries {
+				entries = s.ensureEntries(entryScratch)
+			} else {
+				tmp := []stackEntry(nil)
+				if tmpEntries != nil {
+					tmp = *tmpEntries
+				}
+				entries, borrowed = s.entriesForRead(tmp)
+				if borrowed && tmpEntries != nil {
+					defer func() {
+						*tmpEntries = entries[:0]
+					}()
+				}
+			}
+		}
 		childCount := int(act.ChildCount)
 
 		// Find the start position by scanning backwards, counting only
@@ -1473,11 +1511,20 @@ func recoverAction(entry *ParseActionEntry) (ParseAction, bool) {
 	return ParseAction{}, false
 }
 
-func (p *Parser) findRecoverActionOnStack(s *glrStack, sym Symbol, entryScratch *glrEntryScratch) (int, ParseAction, bool) {
+func (p *Parser) findRecoverActionOnStack(s *glrStack, sym Symbol, tmpEntries *[]stackEntry) (int, ParseAction, bool) {
 	if s == nil {
 		return 0, ParseAction{}, false
 	}
-	entries := s.ensureEntries(entryScratch)
+	tmp := []stackEntry(nil)
+	if tmpEntries != nil {
+		tmp = *tmpEntries
+	}
+	entries, borrowed := s.entriesForRead(tmp)
+	if borrowed && tmpEntries != nil {
+		defer func() {
+			*tmpEntries = entries[:0]
+		}()
+	}
 	if len(entries) == 0 {
 		return 0, ParseAction{}, false
 	}

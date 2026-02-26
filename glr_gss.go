@@ -9,6 +9,7 @@ type gssNode struct {
 	entry stackEntry
 	prev  *gssNode
 	depth int
+	hash  uint64
 }
 
 // gssStack is a shared-prefix stack foundation for future GLR work.
@@ -25,6 +26,51 @@ type gssScratch struct {
 type gssNodeSlab struct {
 	data []gssNode
 	used int
+}
+
+const (
+	gssHashSeed  uint64 = 1469598103934665603
+	gssHashPrime uint64 = 1099511628211
+)
+
+func gssEntryHash(prev uint64, entry stackEntry) uint64 {
+	h := prev ^ uint64(entry.state)
+	h *= gssHashPrime
+
+	n := entry.node
+	if n == nil {
+		h ^= 0xff51afd7ed558ccd
+		h *= gssHashPrime
+		return h
+	}
+
+	h ^= uint64(n.symbol)
+	h *= gssHashPrime
+	h ^= (uint64(n.startByte) << 32) | uint64(n.endByte)
+	h *= gssHashPrime
+	h ^= uint64(n.parseState)
+	h *= gssHashPrime
+	h ^= uint64(n.productionID)
+	h *= gssHashPrime
+	h ^= uint64(len(n.children))
+	h *= gssHashPrime
+
+	var flags uint64
+	if n.isExtra {
+		flags |= 1
+	}
+	if n.isNamed {
+		flags |= 1 << 1
+	}
+	if n.hasError {
+		flags |= 1 << 2
+	}
+	if n.isMissing {
+		flags |= 1 << 3
+	}
+	h ^= flags
+	h *= gssHashPrime
+	return h
 }
 
 func newGSSStack(initial StateID, scratch *gssScratch) gssStack {
@@ -123,8 +169,14 @@ func (s gssStack) materialize(dst []stackEntry) []stackEntry {
 }
 
 func (s *gssScratch) allocNode(entry stackEntry, prev *gssNode, depth int) *gssNode {
+	prevHash := gssHashSeed
+	if prev != nil {
+		prevHash = prev.hash
+	}
+	hash := gssEntryHash(prevHash, entry)
+
 	if s == nil {
-		return &gssNode{entry: entry, prev: prev, depth: depth}
+		return &gssNode{entry: entry, prev: prev, depth: depth, hash: hash}
 	}
 	if len(s.slabs) == 0 {
 		s.slabs = append(s.slabs, gssNodeSlab{data: make([]gssNode, defaultGSSNodeSlabCap)})
@@ -156,6 +208,7 @@ func (s *gssScratch) allocNode(entry stackEntry, prev *gssNode, depth int) *gssN
 		n.entry = entry
 		n.prev = prev
 		n.depth = depth
+		n.hash = hash
 		return n
 	}
 }

@@ -10,6 +10,9 @@ type glrStack struct {
 	// Once a stack is promoted to GSS (shared-prefix), entries becomes an
 	// optional cached materialization for indexed reduce/recover access.
 	entries []stackEntry
+	// cacheEntries keeps a materialized entries cache on this stack when true.
+	// We generally keep this enabled only for the primary stack.
+	cacheEntries bool
 	// byteOffset tracks the end byte of the latest non-nil node on stack.
 	// It avoids rescanning entries in merge/retention hot paths.
 	byteOffset uint32
@@ -73,7 +76,8 @@ func (s *glrEntryScratch) ensureInitialCap(minEntries int) {
 
 func newGLRStack(initial StateID) glrStack {
 	return glrStack{
-		entries: []stackEntry{{state: initial}},
+		entries:      []stackEntry{{state: initial}},
+		cacheEntries: true,
 	}
 }
 
@@ -83,7 +87,7 @@ func newGLRStackWithScratch(initial StateID, scratch *glrEntryScratch) glrStack 
 	}
 	entries := scratch.allocWithCap(1, 8)
 	entries[0] = stackEntry{state: initial}
-	return glrStack{entries: entries}
+	return glrStack{entries: entries, cacheEntries: true}
 }
 
 func (s *glrStack) ensureGSS(scratch *gssScratch) {
@@ -114,15 +118,15 @@ func (s *glrStack) clone() glrStack {
 	if s.gss.head == nil && len(s.entries) > 0 {
 		entries := make([]stackEntry, len(s.entries))
 		copy(entries, s.entries)
-		return glrStack{entries: entries, byteOffset: s.byteOffset, score: s.score}
+		return glrStack{entries: entries, cacheEntries: s.cacheEntries, byteOffset: s.byteOffset, score: s.score}
 	}
 	s.ensureGSS(nil)
-	return glrStack{gss: s.gss.clone(), byteOffset: s.byteOffset, score: s.score}
+	return glrStack{gss: s.gss.clone(), cacheEntries: s.cacheEntries, byteOffset: s.byteOffset, score: s.score}
 }
 
 func (s *glrStack) cloneWithScratch(scratch *gssScratch) glrStack {
 	s.ensureGSS(scratch)
-	return glrStack{gss: s.gss.clone(), byteOffset: s.byteOffset, score: s.score}
+	return glrStack{gss: s.gss.clone(), cacheEntries: false, byteOffset: s.byteOffset, score: s.score}
 }
 
 func (s *glrStack) ensureEntries(entryScratch *glrEntryScratch) []stackEntry {
@@ -144,6 +148,16 @@ func (s *glrStack) ensureEntries(entryScratch *glrEntryScratch) []stackEntry {
 	entries := make([]stackEntry, depth)
 	s.entries = s.gss.materialize(entries)
 	return s.entries
+}
+
+func (s *glrStack) entriesForRead(tmp []stackEntry) ([]stackEntry, bool) {
+	if s.entries != nil {
+		return s.entries, false
+	}
+	if s.gss.head == nil {
+		return nil, false
+	}
+	return s.gss.materialize(tmp), true
 }
 
 func (s *glrStack) push(state StateID, node *Node, entryScratch *glrEntryScratch, gssScratch *gssScratch) {
@@ -255,6 +269,9 @@ func gssStacksEqual(a, b gssStack) bool {
 		return false
 	}
 	if a.head.depth != b.head.depth {
+		return false
+	}
+	if a.head.hash != b.head.hash {
 		return false
 	}
 	for an, bn := a.head, b.head; an != nil && bn != nil; an, bn = an.prev, bn.prev {
