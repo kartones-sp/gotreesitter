@@ -188,8 +188,6 @@ func (p *Parser) tryReuseSubtree(s *glrStack, lookahead Token, ts TokenSource, i
 
 	state := s.top().state
 	for _, n := range candidates {
-		// Reuse only leaf nodes for now. Non-leaf reuse is more efficient
-		// but can violate parser-state continuity in some grammars.
 		if n.ChildCount() > 0 {
 			// Preserve full-root reuse on undo when bytes are identical.
 			if !(n.startByte == 0 &&
@@ -202,40 +200,72 @@ func (p *Parser) tryReuseSubtree(s *glrStack, lookahead Token, ts TokenSource, i
 		if !ok {
 			continue
 		}
+		return reuseNode(s, n, nextState, lookahead, ts, idx, entryScratch, gssScratch)
+	}
 
-		s.push(nextState, n, entryScratch, gssScratch)
-		reusedBytes := n.EndByte() - n.StartByte()
-
-		// If the reused node reaches EOF, we can synthesize EOF directly
-		// instead of consuming every trailing token.
-		if n.EndByte() == idx.sourceLen {
-			pt := n.EndPoint()
-			return Token{
-				Symbol:     0,
-				StartByte:  idx.sourceLen,
-				EndByte:    idx.sourceLen,
-				StartPoint: pt,
-				EndPoint:   pt,
-			}, reusedBytes, true
+	// Conservative fallback: try small non-root non-leaf nodes. This increases
+	// reuse surface without jumping to large ancestor nodes that can trigger
+	// expensive recovery behavior.
+	const maxNonLeafReuseSpan = 2048
+	bestIndex := -1
+	var bestState StateID
+	bestSpan := uint32(^uint32(0))
+	for i, n := range candidates {
+		if n == nil || n.ChildCount() == 0 || n.parent == nil {
+			continue
 		}
-
-		// dfaTokenSource fast skip does not preserve external-scanner state.
-		// Advance token-by-token in that case to keep scanner payload in sync.
-		if dts, ok := ts.(*dfaTokenSource); ok && dts.language != nil && dts.language.ExternalScanner != nil {
-			return advanceTokenSourceTo(ts, lookahead, n.EndByte()), reusedBytes, true
+		span := n.EndByte() - n.StartByte()
+		if span == 0 || span > maxNonLeafReuseSpan {
+			continue
 		}
-
-		if skipper, ok := ts.(PointSkippableTokenSource); ok {
-			return skipper.SkipToByteWithPoint(n.EndByte(), n.EndPoint()), reusedBytes, true
+		nextState, ok := p.reuseTargetState(state, n, lookahead)
+		if !ok {
+			continue
 		}
-		if skipper, ok := ts.(ByteSkippableTokenSource); ok {
-			return skipper.SkipToByte(n.EndByte()), reusedBytes, true
+		if bestIndex < 0 || span < bestSpan {
+			bestIndex = i
+			bestSpan = span
+			bestState = nextState
 		}
-
-		return advanceTokenSourceTo(ts, lookahead, n.EndByte()), reusedBytes, true
+	}
+	if bestIndex >= 0 {
+		return reuseNode(s, candidates[bestIndex], bestState, lookahead, ts, idx, entryScratch, gssScratch)
 	}
 
 	return lookahead, 0, false
+}
+
+func reuseNode(s *glrStack, n *Node, nextState StateID, lookahead Token, ts TokenSource, idx *reuseCursor, entryScratch *glrEntryScratch, gssScratch *gssScratch) (Token, uint32, bool) {
+	s.push(nextState, n, entryScratch, gssScratch)
+	reusedBytes := n.EndByte() - n.StartByte()
+
+	// If the reused node reaches EOF, we can synthesize EOF directly
+	// instead of consuming every trailing token.
+	if n.EndByte() == idx.sourceLen {
+		pt := n.EndPoint()
+		return Token{
+			Symbol:     0,
+			StartByte:  idx.sourceLen,
+			EndByte:    idx.sourceLen,
+			StartPoint: pt,
+			EndPoint:   pt,
+		}, reusedBytes, true
+	}
+
+	// dfaTokenSource fast skip does not preserve external-scanner state.
+	// Advance token-by-token in that case to keep scanner payload in sync.
+	if dts, ok := ts.(*dfaTokenSource); ok && dts.language != nil && dts.language.ExternalScanner != nil {
+		return advanceTokenSourceTo(ts, lookahead, n.EndByte()), reusedBytes, true
+	}
+
+	if skipper, ok := ts.(PointSkippableTokenSource); ok {
+		return skipper.SkipToByteWithPoint(n.EndByte(), n.EndPoint()), reusedBytes, true
+	}
+	if skipper, ok := ts.(ByteSkippableTokenSource); ok {
+		return skipper.SkipToByte(n.EndByte()), reusedBytes, true
+	}
+
+	return advanceTokenSourceTo(ts, lookahead, n.EndByte()), reusedBytes, true
 }
 
 func advanceTokenSourceTo(ts TokenSource, lookahead Token, endByte uint32) Token {
@@ -262,20 +292,29 @@ func (p *Parser) reuseTargetState(state StateID, n *Node, lookahead Token) (Stat
 		if action == nil || len(action.Actions) == 0 {
 			return 0, false
 		}
-		// Reuse only on unambiguous single-shift entries; ambiguous entries
-		// require full GLR branching to preserve correctness.
-		if len(action.Actions) != 1 {
-			return 0, false
+		var uniqueShiftState StateID
+		shiftCount := 0
+		for _, act := range action.Actions {
+			if act.Type != ParseActionShift {
+				continue
+			}
+			targetState := act.State
+			// Extra-token shifts keep the parser state unchanged.
+			if act.Extra {
+				targetState = state
+			}
+			if targetState == n.parseState {
+				return targetState, true
+			}
+			if shiftCount == 0 {
+				uniqueShiftState = targetState
+			}
+			shiftCount++
 		}
-		shift := action.Actions[0]
-		if shift.Type != ParseActionShift {
-			return 0, false
+		if shiftCount == 1 {
+			return uniqueShiftState, true
 		}
-		// Extra-token shifts keep the parser state unchanged.
-		if shift.Extra {
-			return state, true
-		}
-		return shift.State, true
+		return 0, false
 	}
 
 	gotoState := p.lookupGoto(state, n.Symbol())

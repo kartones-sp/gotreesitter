@@ -26,6 +26,11 @@ const (
 	// Full-parse node slabs are much larger; keep more headroom so capacity
 	// growth does not thrash between parses.
 	maxRetainedFullNodeArenaFactor = 16
+
+	// Absolute node-cap retention ceilings to avoid repeated large reallocation
+	// on warm edit/full-parse workloads.
+	maxRetainedIncrementalNodeCap = 1 * 1024 * 1024
+	maxRetainedFullNodeCap        = 2 * 1024 * 1024
 )
 
 type arenaClass uint8
@@ -64,12 +69,12 @@ var (
 	incrementalArenaPool = nodeArenaPool{
 		class:     arenaClassIncremental,
 		slabBytes: incrementalArenaSlab,
-		maxSize:   64,
+		maxSize:   8,
 	}
 	fullArenaPool = nodeArenaPool{
 		class:     arenaClassFull,
 		slabBytes: fullParseArenaSlab,
-		maxSize:   64,
+		maxSize:   4,
 	}
 )
 
@@ -321,10 +326,16 @@ func nodeCapacityForClass(class arenaClass) int {
 
 func maxRetainedNodeCapacityForClass(class arenaClass) int {
 	factor := maxRetainedArenaFactor
+	floor := maxRetainedIncrementalNodeCap
 	if class == arenaClassFull {
 		factor = maxRetainedFullNodeArenaFactor
+		floor = maxRetainedFullNodeCap
 	}
-	return nodeCapacityForClass(class) * factor
+	capByFactor := nodeCapacityForClass(class) * factor
+	if capByFactor < floor {
+		return floor
+	}
+	return capByFactor
 }
 
 func maxRetainedChildSliceCapForClass(class arenaClass) int {

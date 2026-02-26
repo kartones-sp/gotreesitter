@@ -59,15 +59,17 @@ type IncrementalParseProfile struct {
 	ReusedBytes       uint64
 	NewNodesAllocated uint64
 	MaxStacksSeen     int
+	EntryScratchPeak  uint64
 }
 
 type incrementalParseTiming struct {
-	totalNanos     int64
-	reuseNanos     int64
-	reusedSubtrees uint64
-	reusedBytes    uint64
-	newNodes       uint64
-	maxStacksSeen  int
+	totalNanos       int64
+	reuseNanos       int64
+	reusedSubtrees   uint64
+	reusedBytes      uint64
+	newNodes         uint64
+	maxStacksSeen    int
+	entryScratchPeak uint64
 }
 
 func (t *incrementalParseTiming) toProfile() IncrementalParseProfile {
@@ -85,6 +87,7 @@ func (t *incrementalParseTiming) toProfile() IncrementalParseProfile {
 		ReusedBytes:       t.reusedBytes,
 		NewNodesAllocated: t.newNodes,
 		MaxStacksSeen:     t.maxStacksSeen,
+		EntryScratchPeak:  t.entryScratchPeak,
 	}
 }
 
@@ -1120,6 +1123,10 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 			if arena.used >= startUsed {
 				timing.newNodes += uint64(arena.used - startUsed)
 			}
+			peak := uint64(scratch.entries.peakEntriesUsed())
+			if peak > timing.entryScratchPeak {
+				timing.entryScratchPeak = peak
+			}
 		}()
 	}
 	if arenaClass == arenaClassFull {
@@ -1203,7 +1210,7 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 		if len(stacks) > 1 {
 			p.promotePrimaryStack(stacks)
 		}
-		const maxCachedStacks = 32
+		maxCachedStacks := 0
 		for i := range stacks {
 			if i < maxCachedStacks {
 				stacks[i].cacheEntries = true
@@ -2166,7 +2173,6 @@ func (p *Parser) buildResult(stack []stackEntry, source []byte, arena *nodeArena
 		arena = nil
 	}
 
-	borrowed := retainBorrowedArenas(oldTree, reusedAny)
 	expectedRootSymbol := Symbol(0)
 	hasExpectedRoot := false
 	if oldTree != nil && oldTree.RootNode() != nil {
@@ -2178,6 +2184,7 @@ func (p *Parser) buildResult(stack []stackEntry, source []byte, arena *nodeArena
 		candidate := nodes[0]
 		extendNodeToTrailingWhitespace(candidate, source)
 		if !hasExpectedRoot || candidate.symbol == expectedRootSymbol {
+			borrowed := collectBorrowedArenasForRoot(candidate, arena, oldTree, reusedAny)
 			return newTreeWithArenas(candidate, source, p.language, arena, borrowed)
 		}
 
@@ -2192,6 +2199,7 @@ func (p *Parser) buildResult(stack []stackEntry, source []byte, arena *nodeArena
 		}
 		root := newParentNodeInArena(arena, expectedRootSymbol, true, rootChildren, nil, 0)
 		extendNodeToTrailingWhitespace(root, source)
+		borrowed := collectBorrowedArenasForRoot(root, arena, oldTree, reusedAny)
 		return newTreeWithArenas(root, source, p.language, arena, borrowed)
 	}
 
@@ -2285,6 +2293,7 @@ func (p *Parser) buildResult(stack []stackEntry, source []byte, arena *nodeArena
 		}
 		extendNodeToTrailingWhitespace(realRoot, source)
 		if !hasExpectedRoot || realRoot.symbol == expectedRootSymbol {
+			borrowed := collectBorrowedArenasForRoot(realRoot, arena, oldTree, reusedAny)
 			return newTreeWithArenas(realRoot, source, p.language, arena, borrowed)
 		}
 	}
@@ -2297,14 +2306,41 @@ func (p *Parser) buildResult(stack []stackEntry, source []byte, arena *nodeArena
 	root := newParentNodeInArena(arena, rootSymbol, true, rootChildren, nil, 0)
 	root.hasError = true
 	extendNodeToTrailingWhitespace(root, source)
+	borrowed := collectBorrowedArenasForRoot(root, arena, oldTree, reusedAny)
 	return newTreeWithArenas(root, source, p.language, arena, borrowed)
 }
 
-func retainBorrowedArenas(oldTree *Tree, reusedAny bool) []*nodeArena {
-	if !reusedAny || oldTree == nil {
+func collectBorrowedArenasForRoot(root *Node, primary *nodeArena, oldTree *Tree, reusedAny bool) []*nodeArena {
+	if !reusedAny || oldTree == nil || root == nil {
 		return nil
 	}
-	refs := oldTree.referencedArenas()
+	var stack []*Node
+	stack = append(stack, root)
+	refs := make([]*nodeArena, 0, 4)
+
+	for len(stack) > 0 {
+		last := len(stack) - 1
+		n := stack[last]
+		stack = stack[:last]
+		if n == nil {
+			continue
+		}
+		if a := n.ownerArena; a != nil && a != primary {
+			seen := false
+			for i := range refs {
+				if refs[i] == a {
+					seen = true
+					break
+				}
+			}
+			if !seen {
+				refs = append(refs, a)
+			}
+		}
+		if len(n.children) > 0 {
+			stack = append(stack, n.children...)
+		}
+	}
 	if len(refs) == 0 {
 		return nil
 	}

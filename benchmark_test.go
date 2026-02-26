@@ -225,6 +225,7 @@ func BenchmarkGoParseIncrementalSingleByteEditDFA(b *testing.B) {
 	var reusedSubtrees uint64
 	var reusedBytes uint64
 	var newNodesAllocated uint64
+	var entryScratchPeak uint64
 	maxStacksSeen := 0
 
 	editAt := bytes.Index(src, []byte("v := 0"))
@@ -277,6 +278,9 @@ func BenchmarkGoParseIncrementalSingleByteEditDFA(b *testing.B) {
 			reusedSubtrees += prof.ReusedSubtrees
 			reusedBytes += prof.ReusedBytes
 			newNodesAllocated += prof.NewNodesAllocated
+			if prof.EntryScratchPeak > entryScratchPeak {
+				entryScratchPeak = prof.EntryScratchPeak
+			}
 			if prof.MaxStacksSeen > maxStacksSeen {
 				maxStacksSeen = prof.MaxStacksSeen
 			}
@@ -297,6 +301,10 @@ func BenchmarkGoParseIncrementalSingleByteEditDFA(b *testing.B) {
 		fmt.Printf(
 			"STATS edits=%d edit_ns=%d reuse_ns=%d parse_ns=%d reused_subtrees=%d reused_bytes=%d new_nodes=%d max_stacks=%d\n",
 			b.N, editTotalNS, reuseTotalNS, parseTotalNS, reusedSubtrees, reusedBytes, newNodesAllocated, maxStacksSeen,
+		)
+		fmt.Printf(
+			"STATS scratch_peak_entries=%d\n",
+			entryScratchPeak,
 		)
 	}
 	tree.Release()

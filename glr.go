@@ -64,6 +64,8 @@ type glrMergeSlot struct {
 type glrEntryScratch struct {
 	slabs      []stackEntrySlab
 	slabCursor int
+	usedTotal  int
+	peakUsed   int
 }
 
 type stackEntrySlab struct {
@@ -585,6 +587,10 @@ func (s *glrEntryScratch) allocWithCap(length, capacity int) []stackEntry {
 		}
 		start := slab.used
 		slab.used += n
+		s.usedTotal += n
+		if s.usedTotal > s.peakUsed {
+			s.peakUsed = s.usedTotal
+		}
 		s.slabCursor = i
 		end := start + length
 		return slab.data[start : end : start+capacity]
@@ -616,6 +622,8 @@ func (s *glrEntryScratch) grow(entries []stackEntry, minCap int) []stackEntry {
 
 func (s *glrEntryScratch) reset() {
 	if len(s.slabs) == 0 {
+		s.usedTotal = 0
+		s.peakUsed = 0
 		return
 	}
 
@@ -646,6 +654,8 @@ func (s *glrEntryScratch) reset() {
 			slab.used = 0
 		}
 		s.slabCursor = 0
+		s.usedTotal = 0
+		s.peakUsed = 0
 		return
 	}
 
@@ -655,4 +665,13 @@ func (s *glrEntryScratch) reset() {
 		slab.used = 0
 	}
 	s.slabCursor = 0
+	s.usedTotal = 0
+	s.peakUsed = 0
+}
+
+func (s *glrEntryScratch) peakEntriesUsed() int {
+	if s == nil {
+		return 0
+	}
+	return s.peakUsed
 }

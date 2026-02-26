@@ -23,26 +23,27 @@ type editSite struct {
 }
 
 type report struct {
-	GeneratedAtUTC string  `json:"generated_at_utc"`
-	Edits          int     `json:"edits"`
-	FuncCount      int     `json:"func_count"`
-	Seed           uint32  `json:"seed"`
-	MeanEditPathNs float64 `json:"mean_edit_path_ns"`
-	P50EditPathNs  int64   `json:"p50_edit_path_ns"`
-	P95EditPathNs  int64   `json:"p95_edit_path_ns"`
-	P99EditPathNs  int64   `json:"p99_edit_path_ns"`
-	MinEditPathNs  int64   `json:"min_edit_path_ns"`
-	MaxEditPathNs  int64   `json:"max_edit_path_ns"`
-	EditTotalNs    int64   `json:"edit_total_ns"`
-	ReuseTotalNs   int64   `json:"reuse_total_ns"`
-	ParseTotalNs   int64   `json:"parse_total_ns"`
-	ReusedSubtrees uint64  `json:"reused_subtrees"`
-	ReusedBytes    uint64  `json:"reused_bytes"`
-	NewNodes       uint64  `json:"new_nodes_allocated"`
-	MaxStacksSeen  int     `json:"max_stacks_seen"`
-	EditSharePct   float64 `json:"edit_share_pct"`
-	ReuseSharePct  float64 `json:"reuse_share_pct"`
-	ParseSharePct  float64 `json:"parse_share_pct"`
+	GeneratedAtUTC   string  `json:"generated_at_utc"`
+	Edits            int     `json:"edits"`
+	FuncCount        int     `json:"func_count"`
+	Seed             uint32  `json:"seed"`
+	MeanEditPathNs   float64 `json:"mean_edit_path_ns"`
+	P50EditPathNs    int64   `json:"p50_edit_path_ns"`
+	P95EditPathNs    int64   `json:"p95_edit_path_ns"`
+	P99EditPathNs    int64   `json:"p99_edit_path_ns"`
+	MinEditPathNs    int64   `json:"min_edit_path_ns"`
+	MaxEditPathNs    int64   `json:"max_edit_path_ns"`
+	EditTotalNs      int64   `json:"edit_total_ns"`
+	ReuseTotalNs     int64   `json:"reuse_total_ns"`
+	ParseTotalNs     int64   `json:"parse_total_ns"`
+	ReusedSubtrees   uint64  `json:"reused_subtrees"`
+	ReusedBytes      uint64  `json:"reused_bytes"`
+	NewNodes         uint64  `json:"new_nodes_allocated"`
+	MaxStacksSeen    int     `json:"max_stacks_seen"`
+	EntryScratchPeak uint64  `json:"entry_scratch_peak_entries"`
+	EditSharePct     float64 `json:"edit_share_pct"`
+	ReuseSharePct    float64 `json:"reuse_share_pct"`
+	ParseSharePct    float64 `json:"parse_share_pct"`
 }
 
 func main() {
@@ -90,6 +91,7 @@ func main() {
 	var reusedBytes uint64
 	var newNodes uint64
 	maxStacksSeen := 0
+	var entryScratchPeak uint64
 	state := uint32(seed)
 	for i := 0; i < edits; i++ {
 		state = state*1664525 + 1013904223
@@ -122,6 +124,9 @@ func main() {
 		if prof.MaxStacksSeen > maxStacksSeen {
 			maxStacksSeen = prof.MaxStacksSeen
 		}
+		if prof.EntryScratchPeak > entryScratchPeak {
+			entryScratchPeak = prof.EntryScratchPeak
+		}
 		latency = append(latency, editNs+prof.ReuseCursorNanos+prof.ReparseNanos)
 		if old != tree {
 			old.Release()
@@ -130,30 +135,31 @@ func main() {
 	measuredTotalNs := editTotalNs + reuseTotalNs + parseTotalNs
 
 	out := report{
-		GeneratedAtUTC: time.Now().UTC().Format(time.RFC3339),
-		Edits:          edits,
-		FuncCount:      funcCount,
-		Seed:           uint32(seed),
-		MeanEditPathNs: meanInt64(latency),
-		P50EditPathNs:  percentileInt64(latency, 50),
-		P95EditPathNs:  percentileInt64(latency, 95),
-		P99EditPathNs:  percentileInt64(latency, 99),
-		MinEditPathNs:  minInt64(latency),
-		MaxEditPathNs:  maxInt64(latency),
-		EditTotalNs:    editTotalNs,
-		ReuseTotalNs:   reuseTotalNs,
-		ParseTotalNs:   parseTotalNs,
-		ReusedSubtrees: reusedSubtrees,
-		ReusedBytes:    reusedBytes,
-		NewNodes:       newNodes,
-		MaxStacksSeen:  maxStacksSeen,
-		EditSharePct:   sharePct(editTotalNs, measuredTotalNs),
-		ReuseSharePct:  sharePct(reuseTotalNs, measuredTotalNs),
-		ParseSharePct:  sharePct(parseTotalNs, measuredTotalNs),
+		GeneratedAtUTC:   time.Now().UTC().Format(time.RFC3339),
+		Edits:            edits,
+		FuncCount:        funcCount,
+		Seed:             uint32(seed),
+		MeanEditPathNs:   meanInt64(latency),
+		P50EditPathNs:    percentileInt64(latency, 50),
+		P95EditPathNs:    percentileInt64(latency, 95),
+		P99EditPathNs:    percentileInt64(latency, 99),
+		MinEditPathNs:    minInt64(latency),
+		MaxEditPathNs:    maxInt64(latency),
+		EditTotalNs:      editTotalNs,
+		ReuseTotalNs:     reuseTotalNs,
+		ParseTotalNs:     parseTotalNs,
+		ReusedSubtrees:   reusedSubtrees,
+		ReusedBytes:      reusedBytes,
+		NewNodes:         newNodes,
+		MaxStacksSeen:    maxStacksSeen,
+		EntryScratchPeak: entryScratchPeak,
+		EditSharePct:     sharePct(editTotalNs, measuredTotalNs),
+		ReuseSharePct:    sharePct(reuseTotalNs, measuredTotalNs),
+		ParseSharePct:    sharePct(parseTotalNs, measuredTotalNs),
 	}
 	fmt.Printf(
-		"STATS edits=%d edit_ns=%d reuse_ns=%d parse_ns=%d total_ns=%d reused_subtrees=%d reused_bytes=%d new_nodes=%d max_stacks=%d\n",
-		edits, editTotalNs, reuseTotalNs, parseTotalNs, measuredTotalNs, reusedSubtrees, reusedBytes, newNodes, maxStacksSeen,
+		"STATS edits=%d edit_ns=%d reuse_ns=%d parse_ns=%d total_ns=%d reused_subtrees=%d reused_bytes=%d new_nodes=%d max_stacks=%d scratch_peak_entries=%d\n",
+		edits, editTotalNs, reuseTotalNs, parseTotalNs, measuredTotalNs, reusedSubtrees, reusedBytes, newNodes, maxStacksSeen, entryScratchPeak,
 	)
 
 	data, err := json.MarshalIndent(out, "", "  ")
