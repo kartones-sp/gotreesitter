@@ -334,6 +334,9 @@ func (p *Parser) ParseIncremental(source []byte, oldTree *Tree) (*Tree, error) {
 	if err := p.checkDFALexer(); err != nil {
 		return nil, err
 	}
+	if canReuseUnchangedTree(source, oldTree, p.language) {
+		return oldTree, nil
+	}
 	lexer := NewLexer(p.language.LexStates, source)
 	ts := &dfaTokenSource{
 		lexer:             lexer,
@@ -352,6 +355,9 @@ func (p *Parser) ParseIncrementalWithTokenSource(source []byte, oldTree *Tree, t
 	if err := p.checkLanguageCompatible(); err != nil {
 		return nil, err
 	}
+	if canReuseUnchangedTree(source, oldTree, p.language) {
+		return oldTree, nil
+	}
 	return p.parseIncrementalInternal(source, oldTree, p.wrapIncludedRanges(ts), nil), nil
 }
 
@@ -363,6 +369,9 @@ func (p *Parser) ParseIncrementalProfiled(source []byte, oldTree *Tree) (*Tree, 
 	}
 	if err := p.checkDFALexer(); err != nil {
 		return nil, IncrementalParseProfile{}, err
+	}
+	if canReuseUnchangedTree(source, oldTree, p.language) {
+		return oldTree, IncrementalParseProfile{}, nil
 	}
 	lexer := NewLexer(p.language.LexStates, source)
 	ts := &dfaTokenSource{
@@ -383,6 +392,9 @@ func (p *Parser) ParseIncrementalProfiled(source []byte, oldTree *Tree) (*Tree, 
 func (p *Parser) ParseIncrementalWithTokenSourceProfiled(source []byte, oldTree *Tree, ts TokenSource) (*Tree, IncrementalParseProfile, error) {
 	if err := p.checkLanguageCompatible(); err != nil {
 		return nil, IncrementalParseProfile{}, err
+	}
+	if canReuseUnchangedTree(source, oldTree, p.language) {
+		return oldTree, IncrementalParseProfile{}, nil
 	}
 	timing := &incrementalParseTiming{}
 	tree := p.parseIncrementalInternal(source, oldTree, p.wrapIncludedRanges(ts), timing)
@@ -414,10 +426,7 @@ func (p *Parser) checkDFALexer() error {
 
 func (p *Parser) parseIncrementalInternal(source []byte, oldTree *Tree, ts TokenSource, timing *incrementalParseTiming) *Tree {
 	// Fast path: unchanged source and no recorded edits.
-	if oldTree != nil &&
-		oldTree.language == p.language &&
-		len(oldTree.edits) == 0 &&
-		bytes.Equal(oldTree.source, source) {
+	if canReuseUnchangedTree(source, oldTree, p.language) {
 		return oldTree
 	}
 
@@ -460,6 +469,13 @@ func (p *Parser) parseIncrementalInternal(source []byte, oldTree *Tree, ts Token
 		}
 	}
 	return tree
+}
+
+func canReuseUnchangedTree(source []byte, oldTree *Tree, lang *Language) bool {
+	if oldTree == nil || oldTree.language != lang || len(oldTree.edits) != 0 {
+		return false
+	}
+	return bytes.Equal(oldTree.source, source)
 }
 
 // dfaTokenSource wraps the built-in DFA Lexer as a TokenSource.
@@ -907,7 +923,10 @@ func (d *dfaTokenSource) promoteKeyword(tok Token) Token {
 		return tok
 	}
 
-	kw := NewLexer(d.language.KeywordLexStates, d.lexer.source[start:end])
+	kw := Lexer{
+		states: d.language.KeywordLexStates,
+		source: d.lexer.source[start:end],
+	}
 	kwTok := kw.Next(0)
 	if kwTok.Symbol == 0 {
 		return tok
