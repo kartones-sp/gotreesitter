@@ -27,6 +27,8 @@ type PerfCounters struct {
 	ReuseNonLeafSuccesses  uint64
 	ReuseNonLeafBytes      uint64
 	ReuseNonLeafNoGoto     uint64
+	ReuseNonLeafNoGotoTerm uint64
+	ReuseNonLeafNoGotoNt   uint64
 	ReuseNonLeafStateMiss  uint64
 	ReuseNonLeafStateZero  uint64
 	MergeStacksInHist      [maxGLRStacks + 2]uint64
@@ -37,24 +39,26 @@ type PerfCounters struct {
 func ResetPerfCounters()                 {}
 func PerfCountersSnapshot() PerfCounters { return PerfCounters{} }
 
-func perfRecordMergeCall(int)           {}
-func perfRecordMergeAlive(int, int)     {}
-func perfRecordMergePerKeyOverflow()    {}
-func perfRecordMergeReplacement()       {}
-func perfRecordStackEquivalentCall()    {}
-func perfRecordStackEquivalentTrue()    {}
-func perfRecordStackCompare()           {}
-func perfRecordFork(int, uint64)        {}
-func perfRecordMaxConcurrentStacks(int) {}
-func perfRecordLexed(int, int)          {}
-func perfRecordReuseVisited()           {}
-func perfRecordReusePushed(int)         {}
-func perfRecordReusePopped()            {}
-func perfRecordReuseCandidates(int)     {}
-func perfRecordReuseSuccess()           {}
-func perfRecordReuseLeafSuccess()       {}
-func perfRecordReuseNonLeafCheck()      {}
-func perfRecordReuseNonLeafSuccess(uint32) {}
-func perfRecordReuseNonLeafNoGoto()     {}
-func perfRecordReuseNonLeafStateMiss()  {}
-func perfRecordReuseNonLeafStateZero()  {}
+func perfRecordMergeCall(int)                  {}
+func perfRecordMergeAlive(int, int)            {}
+func perfRecordMergePerKeyOverflow()           {}
+func perfRecordMergeReplacement()              {}
+func perfRecordStackEquivalentCall()           {}
+func perfRecordStackEquivalentTrue()           {}
+func perfRecordStackCompare()                  {}
+func perfRecordFork(int, uint64)               {}
+func perfRecordMaxConcurrentStacks(int)        {}
+func perfRecordLexed(int, int)                 {}
+func perfRecordReuseVisited()                  {}
+func perfRecordReusePushed(int)                {}
+func perfRecordReusePopped()                   {}
+func perfRecordReuseCandidates(int)            {}
+func perfRecordReuseSuccess()                  {}
+func perfRecordReuseLeafSuccess()              {}
+func perfRecordReuseNonLeafCheck()             {}
+func perfRecordReuseNonLeafSuccess(uint32)     {}
+func perfRecordReuseNonLeafNoGoto()            {}
+func perfRecordReuseNonLeafNoGotoTerminal()    {}
+func perfRecordReuseNonLeafNoGotoNonTerminal() {}
+func perfRecordReuseNonLeafStateMiss()         {}
+func perfRecordReuseNonLeafStateZero()         {}

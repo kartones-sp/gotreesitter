@@ -33,6 +33,8 @@ type perfCountersData struct {
 	reuseNonLeafSuccesses  atomic.Uint64
 	reuseNonLeafBytes      atomic.Uint64
 	reuseNonLeafNoGoto     atomic.Uint64
+	reuseNonLeafNoGotoTerm atomic.Uint64
+	reuseNonLeafNoGotoNt   atomic.Uint64
 	reuseNonLeafStateMiss  atomic.Uint64
 	reuseNonLeafStateZero  atomic.Uint64
 	mergeStacksInHist      [perfMergeHistBins]atomic.Uint64
@@ -65,6 +67,8 @@ type PerfCounters struct {
 	ReuseNonLeafSuccesses  uint64
 	ReuseNonLeafBytes      uint64
 	ReuseNonLeafNoGoto     uint64
+	ReuseNonLeafNoGotoTerm uint64
+	ReuseNonLeafNoGotoNt   uint64
 	ReuseNonLeafStateMiss  uint64
 	ReuseNonLeafStateZero  uint64
 	MergeStacksInHist      [perfMergeHistBins]uint64
@@ -95,6 +99,8 @@ func ResetPerfCounters() {
 	perfCounters.reuseNonLeafSuccesses.Store(0)
 	perfCounters.reuseNonLeafBytes.Store(0)
 	perfCounters.reuseNonLeafNoGoto.Store(0)
+	perfCounters.reuseNonLeafNoGotoTerm.Store(0)
+	perfCounters.reuseNonLeafNoGotoNt.Store(0)
 	perfCounters.reuseNonLeafStateMiss.Store(0)
 	perfCounters.reuseNonLeafStateZero.Store(0)
 	for i := range perfCounters.mergeStacksInHist {
@@ -132,6 +138,8 @@ func PerfCountersSnapshot() PerfCounters {
 	out.ReuseNonLeafSuccesses = perfCounters.reuseNonLeafSuccesses.Load()
 	out.ReuseNonLeafBytes = perfCounters.reuseNonLeafBytes.Load()
 	out.ReuseNonLeafNoGoto = perfCounters.reuseNonLeafNoGoto.Load()
+	out.ReuseNonLeafNoGotoTerm = perfCounters.reuseNonLeafNoGotoTerm.Load()
+	out.ReuseNonLeafNoGotoNt = perfCounters.reuseNonLeafNoGotoNt.Load()
 	out.ReuseNonLeafStateMiss = perfCounters.reuseNonLeafStateMiss.Load()
 	out.ReuseNonLeafStateZero = perfCounters.reuseNonLeafStateZero.Load()
 	for i := range out.MergeStacksInHist {
@@ -253,6 +261,14 @@ func perfRecordReuseNonLeafSuccess(bytes uint32) {
 
 func perfRecordReuseNonLeafNoGoto() {
 	perfCounters.reuseNonLeafNoGoto.Add(1)
+}
+
+func perfRecordReuseNonLeafNoGotoTerminal() {
+	perfCounters.reuseNonLeafNoGotoTerm.Add(1)
+}
+
+func perfRecordReuseNonLeafNoGotoNonTerminal() {
+	perfCounters.reuseNonLeafNoGotoNt.Add(1)
 }
 
 func perfRecordReuseNonLeafStateMiss() {
