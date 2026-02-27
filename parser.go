@@ -98,9 +98,10 @@ func (p *Parser) Parse(source []byte) (*Tree, error) {
 	}
 	lexer := NewLexer(p.language.LexStates, source)
 	ts := &dfaTokenSource{
-		lexer:             lexer,
-		language:          p.language,
-		lookupActionIndex: p.lookupActionIndex,
+		lexer:               lexer,
+		language:            p.language,
+		lookupActionIndex:   p.lookupActionIndex,
+		lastSyntheticExtPos: -1,
 	}
 	if p.language.ExternalScanner != nil {
 		ts.externalPayload = p.language.ExternalScanner.Create()
@@ -130,9 +131,10 @@ func (p *Parser) ParseIncremental(source []byte, oldTree *Tree) (*Tree, error) {
 	}
 	lexer := NewLexer(p.language.LexStates, source)
 	ts := &dfaTokenSource{
-		lexer:             lexer,
-		language:          p.language,
-		lookupActionIndex: p.lookupActionIndex,
+		lexer:               lexer,
+		language:            p.language,
+		lookupActionIndex:   p.lookupActionIndex,
+		lastSyntheticExtPos: -1,
 	}
 	if p.language.ExternalScanner != nil {
 		ts.externalPayload = p.language.ExternalScanner.Create()
@@ -199,9 +201,11 @@ type dfaTokenSource struct {
 	language *Language
 	state    StateID
 
-	lookupActionIndex func(state StateID, sym Symbol) uint16
-	externalPayload   any
-	externalValid     []bool
+	lookupActionIndex    func(state StateID, sym Symbol) uint16
+	externalPayload      any
+	externalValid        []bool
+	lastSyntheticExtPos  int  // position of last synthetic external token (-1 = none)
+	lastSyntheticExtSym  Symbol
 }
 
 func (d *dfaTokenSource) Close() {
@@ -233,6 +237,7 @@ func (d *dfaTokenSource) Next() Token {
 	}
 	tok := d.lexer.Next(lexState)
 	tok = d.promoteKeyword(tok)
+	tok = d.resolveSymbolAlias(tok)
 	if DebugDFA {
 		name := ""
 		if int(tok.Symbol) < len(d.language.SymbolNames) {
@@ -326,19 +331,32 @@ func (d *dfaTokenSource) syntheticExternalToken(valid []bool) (Token, bool) {
 		if i >= len(valid) || !valid[i] {
 			continue
 		}
+		// Guard against infinite zero-width synthetic token loops.
+		// If we already produced a synthetic token at this position for this
+		// symbol, don't produce another one — let the DFA lexer run instead.
+		if d.lexer.pos == d.lastSyntheticExtPos && sym == d.lastSyntheticExtSym {
+			continue
+		}
 		nameIdx := int(sym)
 		if nameIdx < 0 || nameIdx >= len(d.language.SymbolNames) {
 			continue
 		}
+		var tok Token
+		var ok bool
 		switch d.language.SymbolNames[nameIdx] {
 		case "_automatic_semicolon", "_function_signature_automatic_semicolon", "_implicit_semicolon":
-			return d.syntheticAutomaticSemicolon(sym)
+			tok, ok = d.syntheticAutomaticSemicolon(sym)
 		case "_line_break", "_newline":
-			return d.syntheticLineBreak(sym)
+			tok, ok = d.syntheticLineBreak(sym)
 		case "_line_ending_or_eof":
-			return d.syntheticLineEndingOrEOF(sym)
+			tok, ok = d.syntheticLineEndingOrEOF(sym)
 		case "jsx_text":
-			return d.syntheticJSXText(sym)
+			tok, ok = d.syntheticJSXText(sym)
+		}
+		if ok {
+			d.lastSyntheticExtPos = d.lexer.pos
+			d.lastSyntheticExtSym = sym
+			return tok, true
 		}
 	}
 
@@ -390,6 +408,15 @@ func (d *dfaTokenSource) syntheticAutomaticSemicolon(sym Symbol) (Token, bool) {
 			endCol = 0
 			sawLineBreak = true
 			goto done
+		case '}':
+			// ECMAScript ASI rule: insert semicolon before '}'.
+			return Token{
+				Symbol:     sym,
+				StartByte:  uint32(startPos),
+				EndByte:    uint32(pos),
+				StartPoint: startPoint,
+				EndPoint:   Point{Row: endRow, Column: endCol},
+			}, true
 		default:
 			return Token{}, false
 		}
@@ -645,7 +672,53 @@ func (d *dfaTokenSource) promoteKeyword(tok Token) Token {
 		return tok
 	}
 
+	// Only promote to keyword if the keyword symbol has a valid action in the
+	// current parse state. This mirrors C tree-sitter's ts_parser__advance,
+	// which checks ts_language_table_entry before accepting a keyword.
+	// Without this guard, keywords like `require` in TSX are always promoted
+	// even in contexts where only `identifier` is valid (e.g. call expressions),
+	// causing parse errors.
+	if d.lookupActionIndex != nil && d.lookupActionIndex(d.state, kwTok.Symbol) == 0 {
+		return tok
+	}
+
 	tok.Symbol = kwTok.Symbol
+	return tok
+}
+
+// resolveSymbolAlias handles grammars where the same lexeme has multiple
+// symbol IDs (e.g. '?' as both a ternary operator and an optional type
+// marker). The DFA lexer always produces one fixed symbol, but the parser
+// may expect a different one depending on state. When the DFA's symbol has
+// no valid action, this method tries each alternative symbol with the same
+// name and promotes to the first one that does.
+func (d *dfaTokenSource) resolveSymbolAlias(tok Token) Token {
+	if d.lookupActionIndex == nil || d.language == nil {
+		return tok
+	}
+	if tok.Symbol == 0 {
+		return tok
+	}
+	if d.lookupActionIndex(d.state, tok.Symbol) != 0 {
+		return tok
+	}
+	nameIdx := int(tok.Symbol)
+	if nameIdx >= len(d.language.SymbolNames) {
+		return tok
+	}
+	name := d.language.SymbolNames[nameIdx]
+	if name == "" {
+		return tok
+	}
+	for _, alt := range d.language.TokenSymbolsByName(name) {
+		if alt == tok.Symbol {
+			continue
+		}
+		if d.lookupActionIndex(d.state, alt) != 0 {
+			tok.Symbol = alt
+			return tok
+		}
+	}
 	return tok
 }
 
@@ -793,6 +866,19 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 
 			currentState := s.top().state
 			action := p.lookupAction(currentState, tok.Symbol)
+
+			// --- Symbol alias resolution ---
+			// When the same lexeme has multiple symbol IDs (e.g. '?' as
+			// ternary vs optional-type), the DFA always produces one fixed
+			// symbol. After reductions the parser state may expect a
+			// different alias. Try alternatives before falling through to
+			// error recovery.
+			if (action == nil || len(action.Actions) == 0) && tok.Symbol != 0 {
+				if alt := p.resolveTokenAlias(currentState, tok.Symbol); alt != tok.Symbol {
+					tok.Symbol = alt
+					action = p.lookupAction(currentState, tok.Symbol)
+				}
+			}
 
 			// --- Extra token handling (comments, whitespace) ---
 			if action != nil && len(action.Actions) > 0 &&
@@ -1348,6 +1434,34 @@ func (p *Parser) lookupActionIndex(state StateID, sym Symbol) uint16 {
 		}
 	}
 	return 0
+}
+
+// resolveTokenAlias tries to find an alternative symbol with the same
+// display name that has a valid action in the given parser state. This
+// handles grammars where the same lexeme has multiple symbol IDs and the
+// DFA lexer always produces one fixed ID. Returns sym unchanged if no
+// better alternative is found.
+func (p *Parser) resolveTokenAlias(state StateID, sym Symbol) Symbol {
+	if p.language == nil {
+		return sym
+	}
+	nameIdx := int(sym)
+	if nameIdx >= len(p.language.SymbolNames) {
+		return sym
+	}
+	name := p.language.SymbolNames[nameIdx]
+	if name == "" {
+		return sym
+	}
+	for _, alt := range p.language.TokenSymbolsByName(name) {
+		if alt == sym {
+			continue
+		}
+		if p.lookupActionIndex(state, alt) != 0 {
+			return alt
+		}
+	}
+	return sym
 }
 
 // lookupGoto returns the GOTO target state for a nonterminal symbol.
