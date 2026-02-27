@@ -362,6 +362,213 @@ func TestExtractFieldMapsModernName(t *testing.T) {
 	}
 }
 
+func TestExtractFieldMapsMultiEntry(t *testing.T) {
+	// Multi-entry designators: [N] = followed by multiple {...} blocks.
+	// This mirrors the real JavaScript parser.c format where a single
+	// designator introduces several consecutive entries.
+	src := `
+#define LANGUAGE_VERSION 14
+#define STATE_COUNT 1
+#define LARGE_STATE_COUNT 0
+#define SYMBOL_COUNT 1
+#define ALIAS_COUNT 0
+#define TOKEN_COUNT 1
+#define EXTERNAL_TOKEN_COUNT 0
+#define FIELD_COUNT 4
+#define MAX_ALIAS_SEQUENCE_LENGTH 3
+#define PRODUCTION_ID_COUNT 3
+
+enum ts_field_identifiers {
+  field_arguments = 1,
+  field_function = 2,
+  field_object = 3,
+  field_property = 4,
+};
+
+static const char * const ts_symbol_names[] = {
+  [0] = "end",
+};
+
+static const TSSymbolMetadata ts_symbol_metadata[] = {
+  [0] = { .visible = false, .named = false },
+};
+
+static const char * const ts_field_names[] = {
+  [0] = NULL,
+  [1] = "arguments",
+  [2] = "function",
+  [3] = "object",
+  [4] = "property",
+};
+
+static const TSFieldMapSlice ts_field_map_slices[PRODUCTION_ID_COUNT] = {
+  [1] = {.index = 0, .length = 2},
+  [2] = {.index = 2, .length = 2},
+};
+
+static const TSFieldMapEntry ts_field_map_entries[] = {
+  [0] =
+    {field_arguments, 1},
+    {field_function, 0},
+  [2] =
+    {field_object, 0},
+    {field_property, 2},
+};
+
+static const TSLexMode ts_lex_modes[STATE_COUNT] = {
+  [0] = {.lex_state = 0},
+};
+
+static const TSParseActionEntry ts_parse_actions[] = {
+  [0] = {.entry = {.count = 0, .reusable = false}},
+};
+
+const TSLanguage *tree_sitter_multi_field(void) {
+  static const TSLanguage language = { .version = LANGUAGE_VERSION };
+  return &language;
+}
+`
+	g := &ExtractedGrammar{}
+	g.enumValues = extractEnum(src)
+	g.ProductionIDCount = 3
+	g.FieldCount = 4
+
+	if err := extractFieldMaps(src, g); err != nil {
+		t.Fatal(err)
+	}
+
+	// Expect 4 entries: indices 0, 1, 2, 3.
+	if len(g.FieldMapEntries) != 4 {
+		t.Fatalf("len(FieldMapEntries) = %d, want 4", len(g.FieldMapEntries))
+	}
+
+	// [0] = {field_arguments, 1} → FieldID=1, ChildIndex=1
+	if g.FieldMapEntries[0].FieldID != 1 {
+		t.Errorf("FieldMapEntries[0].FieldID = %d, want 1 (field_arguments)", g.FieldMapEntries[0].FieldID)
+	}
+	if g.FieldMapEntries[0].ChildIndex != 1 {
+		t.Errorf("FieldMapEntries[0].ChildIndex = %d, want 1", g.FieldMapEntries[0].ChildIndex)
+	}
+
+	// [1] = {field_function, 0} → FieldID=2, ChildIndex=0 (continuation after [0]=)
+	if g.FieldMapEntries[1].FieldID != 2 {
+		t.Errorf("FieldMapEntries[1].FieldID = %d, want 2 (field_function)", g.FieldMapEntries[1].FieldID)
+	}
+	if g.FieldMapEntries[1].ChildIndex != 0 {
+		t.Errorf("FieldMapEntries[1].ChildIndex = %d, want 0", g.FieldMapEntries[1].ChildIndex)
+	}
+
+	// [2] = {field_object, 0} → FieldID=3, ChildIndex=0
+	if g.FieldMapEntries[2].FieldID != 3 {
+		t.Errorf("FieldMapEntries[2].FieldID = %d, want 3 (field_object)", g.FieldMapEntries[2].FieldID)
+	}
+	if g.FieldMapEntries[2].ChildIndex != 0 {
+		t.Errorf("FieldMapEntries[2].ChildIndex = %d, want 0", g.FieldMapEntries[2].ChildIndex)
+	}
+
+	// [3] = {field_property, 2} → FieldID=4, ChildIndex=2 (continuation after [2]=)
+	if g.FieldMapEntries[3].FieldID != 4 {
+		t.Errorf("FieldMapEntries[3].FieldID = %d, want 4 (field_property)", g.FieldMapEntries[3].FieldID)
+	}
+	if g.FieldMapEntries[3].ChildIndex != 2 {
+		t.Errorf("FieldMapEntries[3].ChildIndex = %d, want 2", g.FieldMapEntries[3].ChildIndex)
+	}
+}
+
+func TestExtractFieldMapsMixedPositionalNamed(t *testing.T) {
+	// Mixed positional + named syntax: {field_source, 2, .inherited = true}
+	// This is the format used by JavaScript and TSX grammars where the
+	// field_id and child_index are positional but .inherited is named.
+	src := `
+#define LANGUAGE_VERSION 14
+#define STATE_COUNT 1
+#define LARGE_STATE_COUNT 0
+#define SYMBOL_COUNT 1
+#define ALIAS_COUNT 0
+#define TOKEN_COUNT 1
+#define EXTERNAL_TOKEN_COUNT 0
+#define FIELD_COUNT 2
+#define MAX_ALIAS_SEQUENCE_LENGTH 3
+#define PRODUCTION_ID_COUNT 2
+
+enum ts_field_identifiers {
+  field_source = 1,
+  field_decorator = 2,
+};
+
+static const char * const ts_symbol_names[] = {
+  [0] = "end",
+};
+
+static const TSSymbolMetadata ts_symbol_metadata[] = {
+  [0] = { .visible = false, .named = false },
+};
+
+static const char * const ts_field_names[] = {
+  [0] = NULL,
+  [1] = "source",
+  [2] = "decorator",
+};
+
+static const TSFieldMapSlice ts_field_map_slices[PRODUCTION_ID_COUNT] = {
+  [1] = {.index = 0, .length = 2},
+};
+
+static const TSFieldMapEntry ts_field_map_entries[] = {
+  [0] =
+    {field_decorator, 0, .inherited = true},
+    {field_source, 2, .inherited = true},
+};
+
+static const TSLexMode ts_lex_modes[STATE_COUNT] = {
+  [0] = {.lex_state = 0},
+};
+
+static const TSParseActionEntry ts_parse_actions[] = {
+  [0] = {.entry = {.count = 0, .reusable = false}},
+};
+
+const TSLanguage *tree_sitter_mixed_field(void) {
+  static const TSLanguage language = { .version = LANGUAGE_VERSION };
+  return &language;
+}
+`
+	g := &ExtractedGrammar{}
+	g.enumValues = extractEnum(src)
+	g.ProductionIDCount = 2
+	g.FieldCount = 2
+
+	if err := extractFieldMaps(src, g); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(g.FieldMapEntries) != 2 {
+		t.Fatalf("len(FieldMapEntries) = %d, want 2", len(g.FieldMapEntries))
+	}
+
+	// [0] = {field_decorator, 0, .inherited = true}
+	if g.FieldMapEntries[0].FieldID != 2 {
+		t.Errorf("FieldMapEntries[0].FieldID = %d, want 2 (field_decorator)", g.FieldMapEntries[0].FieldID)
+	}
+	if g.FieldMapEntries[0].ChildIndex != 0 {
+		t.Errorf("FieldMapEntries[0].ChildIndex = %d, want 0", g.FieldMapEntries[0].ChildIndex)
+	}
+	if !g.FieldMapEntries[0].Inherited {
+		t.Error("FieldMapEntries[0].Inherited = false, want true")
+	}
+
+	// [1] = {field_source, 2, .inherited = true}
+	if g.FieldMapEntries[1].FieldID != 1 {
+		t.Errorf("FieldMapEntries[1].FieldID = %d, want 1 (field_source)", g.FieldMapEntries[1].FieldID)
+	}
+	if g.FieldMapEntries[1].ChildIndex != 2 {
+		t.Errorf("FieldMapEntries[1].ChildIndex = %d, want 2", g.FieldMapEntries[1].ChildIndex)
+	}
+	if !g.FieldMapEntries[1].Inherited {
+		t.Error("FieldMapEntries[1].Inherited = false, want true")
+	}
+}
+
 func TestExtractParseTable(t *testing.T) {
 	g := miniGrammar()
 	g.LargeStateCount = 2

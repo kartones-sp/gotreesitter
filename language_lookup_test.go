@@ -17,6 +17,34 @@ func TestSymbolByNameReturnsFirstDuplicate(t *testing.T) {
 	}
 }
 
+func TestCanonicalSymbolMapsDuplicatesToFirst(t *testing.T) {
+	lang := &Language{
+		TokenCount:  5,
+		SymbolNames: []string{"end", "identifier", "identifier", "stmt", "identifier"},
+	}
+
+	// All "identifier" symbols (1, 2, 4) should canonicalize to 1 (first occurrence).
+	for _, sym := range []Symbol{1, 2, 4} {
+		canonical := lang.CanonicalSymbol(sym)
+		if canonical != 1 {
+			t.Errorf("CanonicalSymbol(%d) = %d, want 1", sym, canonical)
+		}
+	}
+
+	// Non-duplicate symbols map to themselves.
+	if c := lang.CanonicalSymbol(0); c != 0 {
+		t.Errorf("CanonicalSymbol(0) = %d, want 0", c)
+	}
+	if c := lang.CanonicalSymbol(3); c != 3 {
+		t.Errorf("CanonicalSymbol(3) = %d, want 3", c)
+	}
+
+	// Out-of-range symbol returns itself.
+	if c := lang.CanonicalSymbol(99); c != 99 {
+		t.Errorf("CanonicalSymbol(99) = %d, want 99", c)
+	}
+}
+
 func TestTokenSymbolsByNameFiltersTerminals(t *testing.T) {
 	lang := &Language{
 		TokenCount:  3,

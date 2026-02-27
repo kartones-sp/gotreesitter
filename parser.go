@@ -1006,12 +1006,24 @@ func (p *Parser) applyAction(s *glrStack, act ParseAction, tok Token, anyReduced
 			}
 		}
 
-		rawFieldIDs := p.buildFieldIDs(childCount, act.ProductionID, arena)
+		rawFieldIDs, hasInherited := p.buildFieldIDs(childCount, act.ProductionID, arena)
 		hasFields := false
 		for _, fid := range rawFieldIDs {
 			if fid != 0 {
 				hasFields = true
 				break
+			}
+		}
+
+		// When inherited entries exist, hidden children being flattened may
+		// carry their own field IDs that must be preserved in the parent.
+		if !hasFields && hasInherited {
+			for i := 0; i < actualEntryCount; i++ {
+				n := s.entries[start+i].node
+				if !n.isExtra && !symbolVisible(p.language, n.symbol) && n.fieldIDs != nil {
+					hasFields = true
+					break
+				}
 			}
 		}
 
@@ -1044,10 +1056,15 @@ func (p *Parser) applyAction(s *glrStack, act ParseAction, tok Token, anyReduced
 				continue
 			}
 
+			// Flatten hidden node's children into the parent.
+			// Preserve the hidden node's own field IDs (from its production)
+			// which correctly resolve inherited fields.
 			for j, child := range n.children {
 				children[out] = child
 				if fieldIDs != nil {
-					if j == 0 {
+					if j < len(n.fieldIDs) && n.fieldIDs[j] != 0 {
+						fieldIDs[out] = n.fieldIDs[j]
+					} else if j == 0 {
 						fieldIDs[out] = fid
 					} else {
 						fieldIDs[out] = 0
@@ -1192,23 +1209,25 @@ func spanEndExcludingExtra(_ *Language, n *Node) (uint32, Point, bool) {
 }
 
 // buildFieldIDs creates the field ID slice for a reduce action.
-func (p *Parser) buildFieldIDs(childCount int, productionID uint16, arena *nodeArena) []FieldID {
+// hasInherited reports whether the production contains inherited field
+// entries whose fields are defined inside hidden child sub-productions.
+func (p *Parser) buildFieldIDs(childCount int, productionID uint16, arena *nodeArena) (fieldIDs []FieldID, hasInherited bool) {
 	if childCount <= 0 || len(p.language.FieldMapEntries) == 0 {
-		return nil
+		return nil, false
 	}
 
 	pid := int(productionID)
 	if pid >= len(p.language.FieldMapSlices) {
-		return nil
+		return nil, false
 	}
 
 	fm := p.language.FieldMapSlices[pid]
 	count := int(fm[1])
 	if count == 0 {
-		return nil
+		return nil, false
 	}
 
-	fieldIDs := arena.allocFieldIDSlice(childCount)
+	fieldIDs = arena.allocFieldIDSlice(childCount)
 	start := int(fm[0])
 	assigned := false
 	for i := 0; i < count; i++ {
@@ -1217,16 +1236,20 @@ func (p *Parser) buildFieldIDs(childCount int, productionID uint16, arena *nodeA
 			break
 		}
 		entry := p.language.FieldMapEntries[entryIdx]
+		if entry.Inherited {
+			hasInherited = true
+			continue
+		}
 		if int(entry.ChildIndex) < len(fieldIDs) {
 			fieldIDs[entry.ChildIndex] = entry.FieldID
 			assigned = true
 		}
 	}
 
-	if !assigned {
-		return nil
+	if !assigned && !hasInherited {
+		return nil, false
 	}
-	return fieldIDs
+	return fieldIDs, hasInherited
 }
 
 // buildResultFromGLR picks the best stack and constructs the final tree.

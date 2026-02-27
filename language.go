@@ -161,6 +161,7 @@ type Language struct {
 	symbolNameMap      map[string]Symbol
 	tokenSymbolNameMap map[string][]Symbol
 	fieldNameMap       map[string]FieldID
+	canonicalSymbols   []Symbol // maps each symbol to its canonical form (first with same name)
 
 	symbolMapOnce sync.Once
 	fieldMapOnce  sync.Once
@@ -210,6 +211,7 @@ func (l *Language) buildSymbolMaps() {
 	l.symbolMapOnce.Do(func() {
 		l.symbolNameMap = make(map[string]Symbol, len(l.SymbolNames))
 		l.tokenSymbolNameMap = make(map[string][]Symbol)
+		l.canonicalSymbols = make([]Symbol, len(l.SymbolNames))
 
 		tokenCount := int(l.TokenCount)
 		if tokenCount > len(l.SymbolNames) {
@@ -217,19 +219,31 @@ func (l *Language) buildSymbolMaps() {
 		}
 
 		for i, sn := range l.SymbolNames {
+			sym := Symbol(i)
 			if sn == "" {
+				l.canonicalSymbols[i] = sym
 				continue
 			}
-			sym := Symbol(i)
-			// Keep the first match so duplicate names remain deterministic.
 			if _, exists := l.symbolNameMap[sn]; !exists {
 				l.symbolNameMap[sn] = sym
 			}
+			l.canonicalSymbols[i] = l.symbolNameMap[sn]
 			if i < tokenCount {
 				l.tokenSymbolNameMap[sn] = append(l.tokenSymbolNameMap[sn], sym)
 			}
 		}
 	})
+}
+
+// CanonicalSymbol returns the canonical symbol for sym. Symbols that share
+// the same name (aliases, duplicates) all map to the same canonical ID.
+// This mirrors C tree-sitter's ts_language_public_symbol behavior.
+func (l *Language) CanonicalSymbol(sym Symbol) Symbol {
+	l.buildSymbolMaps()
+	if int(sym) < len(l.canonicalSymbols) {
+		return l.canonicalSymbols[sym]
+	}
+	return sym
 }
 
 // FieldByName returns the field ID for a given name, or (0, false) if not found.

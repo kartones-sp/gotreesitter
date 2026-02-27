@@ -222,8 +222,9 @@ func (q *Query) executeNode(root *Node, lang *Language, source []byte) []QueryMa
 	return matches
 }
 
-func (q *Query) rootPatternCandidates(sym Symbol) []int {
-	if cands, ok := q.rootCandidatesBySymbol[sym]; ok {
+func (q *Query) rootPatternCandidates(sym Symbol, lang *Language) []int {
+	canonical := lang.CanonicalSymbol(sym)
+	if cands, ok := q.rootCandidatesBySymbol[canonical]; ok {
 		return cands
 	}
 	return q.rootFallbackCandidates
@@ -367,7 +368,7 @@ func (c *QueryCursor) NextMatch() (QueryMatch, bool) {
 			}
 
 			c.currentNode = n
-			c.currentCandidates = q.rootPatternCandidates(n.Symbol())
+			c.currentCandidates = q.rootPatternCandidates(n.Symbol(), c.lang)
 			c.candidateIdx = 0
 		}
 
@@ -1041,8 +1042,8 @@ func (q *Query) nodeMatchesStep(step *QueryStep, node *Node, lang *Language) boo
 		return true
 	}
 
-	// Symbol matching.
-	if node.Symbol() != step.symbol {
+	// Symbol matching (canonical form handles aliases/duplicates).
+	if lang.CanonicalSymbol(node.Symbol()) != lang.CanonicalSymbol(step.symbol) {
 		return false
 	}
 
@@ -1079,7 +1080,7 @@ func alternativeMatchesNode(alt alternativeSymbol, node *Node, lang *Language) b
 		return !node.IsNamed() && node.Type(lang) == alt.textMatch
 	}
 
-	return node.Symbol() == alt.symbol && node.IsNamed() == alt.isNamed
+	return lang.CanonicalSymbol(node.Symbol()) == lang.CanonicalSymbol(alt.symbol) && node.IsNamed() == alt.isNamed
 }
 
 // PatternCount returns the number of patterns in the query.

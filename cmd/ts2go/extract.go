@@ -757,22 +757,39 @@ func extractFieldMapEntries(source string, g *ExtractedGrammar) ([]FieldMapEntry
 	var parsed []idxEntry
 	maxIdx := -1
 
-	// Explicit indexed entries: [N] = {...}
-	indexedRe := regexp.MustCompile(`\[(\w+)\]\s*=\s*\{([^}]*)\}`)
-	indexedMatches := indexedRe.FindAllStringSubmatch(body, -1)
+	// Explicit indexed entries: [N] = {...}, {...}, ...
+	// C designated initializers allow multiple consecutive entries after a
+	// single [N] = designator. Entries are assigned sequential indices
+	// N, N+1, N+2, etc.
+	designatorRe := regexp.MustCompile(`\[(\w+)\]\s*=`)
+	designatorLocs := designatorRe.FindAllStringSubmatchIndex(body, -1)
 
-	for _, m := range indexedMatches {
-		idx, ok := parseFieldMapIndex(g, m[1])
+	for i, dm := range designatorLocs {
+		idxToken := body[dm[2]:dm[3]]
+		idx, ok := parseFieldMapIndex(g, idxToken)
 		if !ok {
 			continue
 		}
-		entry, ok := parseFieldMapEntry(g, m[2])
-		if !ok {
-			continue
+
+		// Region between this designator and the next (or end of body).
+		regionStart := dm[1]
+		regionEnd := len(body)
+		if i+1 < len(designatorLocs) {
+			regionEnd = designatorLocs[i+1][0]
 		}
-		parsed = append(parsed, idxEntry{idx: idx, entry: entry})
-		if idx > maxIdx {
-			maxIdx = idx
+		region := body[regionStart:regionEnd]
+
+		entryRe := regexp.MustCompile(`\{([^{}]+)\}`)
+		for j, em := range entryRe.FindAllStringSubmatch(region, -1) {
+			entry, ok := parseFieldMapEntry(g, em[1])
+			if !ok {
+				continue
+			}
+			entryIdx := idx + j
+			parsed = append(parsed, idxEntry{idx: entryIdx, entry: entry})
+			if entryIdx > maxIdx {
+				maxIdx = entryIdx
+			}
 		}
 	}
 
@@ -821,6 +838,7 @@ func parseFieldMapIndex(g *ExtractedGrammar, token string) (int, bool) {
 func parseFieldMapEntry(g *ExtractedGrammar, body string) (FieldMapEntry, bool) {
 	entry := FieldMapEntry{}
 	found := false
+	inheritedSet := false
 
 	// Named fields: .field_id = X, .child_index = N, .inherited = bool
 	if fieldID, ok := extractFieldMapTokenField(g, body, `\.field_id\s*=\s*([^,}]+)`); ok {
@@ -834,6 +852,7 @@ func parseFieldMapEntry(g *ExtractedGrammar, body string) (FieldMapEntry, bool) 
 	if inherited, ok := extractFieldMapBoolField(body, `\.inherited\s*=\s*(true|false)`); ok {
 		entry.Inherited = inherited
 		found = true
+		inheritedSet = true
 	}
 
 	// Some generator versions use .field = ... and .index = ...
@@ -850,30 +869,28 @@ func parseFieldMapEntry(g *ExtractedGrammar, body string) (FieldMapEntry, bool) 
 		}
 	}
 
-	// Fallback for positional entries: field_id, child_index, inherited
-	if !found {
-		tokens := parseIdentifierLikeTokens(body)
-		if len(tokens) == 0 {
-			return entry, false
+	// Positional fallback for fields not resolved by named syntax.
+	// C entries can mix positional and named styles, e.g.:
+	//   {field_source, 2, .inherited = true}
+	// The named pass above captures .inherited, but field_source and 2
+	// are positional and must still be parsed.
+	tokens := parseIdentifierLikeTokens(body)
+	if entry.FieldID == 0 && len(tokens) >= 1 {
+		if v, ok := parseFieldMapToken(g, tokens[0]); ok {
+			entry.FieldID = v
+			found = true
 		}
-
-		if len(tokens) >= 1 {
-			if v, ok := parseFieldMapToken(g, tokens[0]); ok {
-				entry.FieldID = v
-				found = true
-			}
+	}
+	if entry.ChildIndex == 0 && len(tokens) >= 2 {
+		if v, ok := parseFieldMapUnsignedInt(tokens[1]); ok {
+			entry.ChildIndex = v
+			found = true
 		}
-		if len(tokens) >= 2 {
-			if v, ok := parseFieldMapUnsignedInt(tokens[1]); ok {
-				entry.ChildIndex = v
-				found = true
-			}
-		}
-		if len(tokens) >= 3 {
-			if v, ok := parseFieldMapBool(tokens[2]); ok {
-				entry.Inherited = v
-				found = true
-			}
+	}
+	if !inheritedSet && len(tokens) >= 3 {
+		if v, ok := parseFieldMapBool(tokens[2]); ok {
+			entry.Inherited = v
+			found = true
 		}
 	}
 
