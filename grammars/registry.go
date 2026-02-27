@@ -67,13 +67,5 @@ func AllLanguages() []LangEntry {
 		}
 		out[i].TagsQuery = inferredTagsQuery(out[i])
 	}
-	for i := range out {
-		if out[i].Quality != "" {
-			continue
-		}
-		lang := out[i].Language()
-		report := EvaluateParseSupport(out[i], lang)
-		out[i].Quality = qualityFromBackend(report.Backend)
-	}
 	return out
 }
