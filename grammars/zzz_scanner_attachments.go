@@ -82,7 +82,7 @@ func init() {
 		"templ":          TemplExternalScanner{},
 		"org":            OrgExternalScanner{},
 		"odin":           OdinExternalScanner{},
-		"tsx":            TsxExternalScanner{},
+		// "tsx": TsxExternalScanner{}, // disabled: symbol IDs mismatch after blob regen; synthetic scanner handles ASI correctly
 		"d":              DExternalScanner{},
 		"nickel":         NickelExternalScanner{},
 		"pug":            PugExternalScanner{},
@@ -119,8 +119,8 @@ func init() {
 		"djot":            DjotExternalScanner{},
 		"cpp":             CppExternalScanner{},
 		"caddy":           CaddyExternalScanner{},
-		"javascript":      JavaScriptExternalScanner{},
-		"typescript":      TypeScriptExternalScanner{},
+		// "javascript": JavaScriptExternalScanner{}, // disabled: symbol IDs mismatch after blob regen; synthetic scanner handles ASI correctly
+		// "typescript": TypeScriptExternalScanner{}, // disabled: symbol IDs mismatch after blob regen; synthetic scanner handles ASI correctly
 		"rust":            RustExternalScanner{},
 		"hcl":             HclExternalScanner{},
 		"rescript":        RescriptExternalScanner{},

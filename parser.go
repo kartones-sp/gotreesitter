@@ -807,6 +807,8 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 
 	needToken := true
 	var tok Token
+	lastUnwindByte := int64(-1) // byte position of last unwind; -1 = no unwind yet
+	tokensOKSinceUnwind := 0   // count of tokens with valid actions since last unwind
 
 	// Per-primary-stack infinite-reduce detection.
 	var lastReduceState StateID
@@ -927,6 +929,42 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 					continue
 				}
 
+				// Stack-unwinding ("panic mode") error recovery:
+				// Search the stack (top → bottom) for the shallowest state
+				// that has a valid non-RECOVER action (SHIFT or REDUCE) for
+				// the current token. If found, pop to that depth, wrap
+				// discarded nodes in an ERROR parent, and retry the token.
+				if tokensOKSinceUnwind > 0 || lastUnwindByte < 0 {
+					if len(s.entries) > 1 {
+						if unwindDepth, ok := p.findUnwindTarget(s, tok.Symbol); ok {
+							var errChildren []*Node
+							for i := unwindDepth + 1; i < len(s.entries); i++ {
+								if s.entries[i].node != nil {
+									errChildren = append(errChildren, s.entries[i].node)
+								}
+							}
+							s.entries = s.entries[:unwindDepth+1]
+							if len(errChildren) > 0 {
+								if arena != nil {
+									ac := arena.allocNodeSlice(len(errChildren))
+									copy(ac, errChildren)
+									errChildren = ac
+								}
+								errParent := newParentNodeInArena(arena, errorSymbol, false, errChildren, nil, 0)
+								errParent.hasError = true
+								errParent.isExtra = true
+								errParent.parseState = s.entries[unwindDepth].state
+								s.push(s.entries[unwindDepth].state, errParent, &scratch.entries)
+								nodeCount++
+							}
+							lastUnwindByte = int64(tok.StartByte)
+							tokensOKSinceUnwind = 0
+							anyReduced = true
+							continue
+						}
+					}
+				}
+
 				// Only stack: error recovery — wrap token in error node.
 				if len(s.entries) == 0 {
 					return finalize(stacks)
@@ -944,6 +982,11 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 			// --- GLR: fork for multiple actions ---
 			// For single-action entries (the common case), no fork occurs.
 			// For multi-action entries, clone the stack for each alternative.
+			// A successful action means the parser is making progress;
+			// count tokens with valid actions since last unwind.
+			if lastUnwindByte >= 0 && int64(tok.StartByte) > lastUnwindByte {
+				tokensOKSinceUnwind++
+			}
 			actions := action.Actions
 			if len(actions) > 1 {
 				// Save state before applying any action.
@@ -1229,6 +1272,30 @@ func (p *Parser) findRecoverActionOnStack(s *glrStack, sym Symbol) (int, ParseAc
 		}
 	}
 	return 0, ParseAction{}, false
+}
+
+// findUnwindTarget searches the stack from top to bottom for the shallowest
+// state that has a non-extra SHIFT action for the given lookahead symbol.
+// SHIFT is required (not REDUCE) because after unwinding, the error node
+// is marked as extra; a SHIFT directly consumes the token and advances the
+// parse, whereas a REDUCE may loop if the error node doesn't count toward
+// the reduce's child count. Returns the depth index and true if found.
+func (p *Parser) findUnwindTarget(s *glrStack, sym Symbol) (int, bool) {
+	if s == nil || len(s.entries) <= 1 {
+		return 0, false
+	}
+	for depth := len(s.entries) - 2; depth >= 0; depth-- {
+		state := s.entries[depth].state
+		action := p.lookupAction(state, sym)
+		if action == nil || len(action.Actions) == 0 {
+			continue
+		}
+		act := action.Actions[0]
+		if act.Type == ParseActionShift && !act.Extra {
+			return depth, true
+		}
+	}
+	return 0, false
 }
 
 func (p *Parser) aliasSymbolForChild(productionID uint16, childIndex int) Symbol {
@@ -1602,7 +1669,8 @@ func (p *Parser) buildResult(stack []stackEntry, source []byte, arena *nodeArena
 	}
 
 	rootChildren := nodes
-	rootSymbol := nodes[len(nodes)-1].symbol
+	// Grammar root symbol: first non-terminal = Symbol(TokenCount).
+	rootSymbol := Symbol(p.language.TokenCount)
 	if hasExpectedRoot {
 		rootSymbol = expectedRootSymbol
 	}

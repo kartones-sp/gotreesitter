@@ -194,8 +194,10 @@ func TestAuditParseSupportIncludesJavaScriptDFA(t *testing.T) {
 	if jsReport == nil {
 		t.Fatal("expected javascript parse support report")
 	}
-	if jsReport.Backend != ParseBackendDFA {
-		t.Fatalf("expected javascript backend %q, got %q", ParseBackendDFA, jsReport.Backend)
+	// External scanner for JS is temporarily disabled (symbol ID mismatch
+	// after blob regen). Synthetic ASI scanner is used instead → dfa-partial.
+	if jsReport.Backend != ParseBackendDFAPartial {
+		t.Fatalf("expected javascript backend %q, got %q", ParseBackendDFAPartial, jsReport.Backend)
 	}
 }
 
@@ -215,8 +217,10 @@ func TestAuditParseSupportIncludesTypeScriptDFA(t *testing.T) {
 	if tsReport == nil {
 		t.Fatal("expected typescript parse support report")
 	}
-	if tsReport.Backend != ParseBackendDFA {
-		t.Fatalf("expected typescript backend %q, got %q", ParseBackendDFA, tsReport.Backend)
+	// External scanner for TS is temporarily disabled (symbol ID mismatch
+	// after blob regen). Synthetic ASI scanner is used instead → dfa-partial.
+	if tsReport.Backend != ParseBackendDFAPartial {
+		t.Fatalf("expected typescript backend %q, got %q", ParseBackendDFAPartial, tsReport.Backend)
 	}
 }
 
