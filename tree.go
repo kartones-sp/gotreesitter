@@ -843,3 +843,95 @@ func shiftSubtreeAfterEdit(roots []*Node, edit InputEdit, byteDelta int64) {
 		}
 	}
 }
+
+// DiffChangedRanges compares two syntax trees and returns the minimal
+// ranges where syntactic structure differs. The old tree should have been
+// edited (via Tree.Edit) to match the new tree's source positions before
+// reparsing.
+//
+// This is equivalent to C tree-sitter's ts_tree_get_changed_ranges().
+func DiffChangedRanges(oldTree, newTree *Tree) []Range {
+	if oldTree == nil || newTree == nil {
+		return nil
+	}
+	oldRoot := oldTree.RootNode()
+	newRoot := newTree.RootNode()
+	if oldRoot == nil || newRoot == nil {
+		return nil
+	}
+
+	var ranges []Range
+	diffNodes(oldRoot, newRoot, &ranges)
+	return coalesceRanges(ranges)
+}
+
+// diffNodes recursively compares old and new tree nodes, appending changed
+// ranges when structural differences are found.
+func diffNodes(oldNode, newNode *Node, ranges *[]Range) {
+	// If both nodes are structurally identical, nothing changed.
+	if nodesStructurallyEqual(oldNode, newNode) {
+		return
+	}
+
+	// If they differ at the symbol level or child count, the entire range is changed.
+	if oldNode.Symbol() != newNode.Symbol() ||
+		oldNode.ChildCount() != newNode.ChildCount() {
+		addChangedRange(oldNode, newNode, ranges)
+		return
+	}
+
+	// Leaf nodes (no children) that are not structurally equal: they differ in
+	// byte range or one of them has been marked dirty. Report the range.
+	if oldNode.ChildCount() == 0 {
+		addChangedRange(oldNode, newNode, ranges)
+		return
+	}
+
+	// Same symbol and child count — recurse into children.
+	for i := 0; i < oldNode.ChildCount(); i++ {
+		oldChild := oldNode.Child(i)
+		newChild := newNode.Child(i)
+		diffNodes(oldChild, newChild, ranges)
+	}
+}
+
+// nodesStructurallyEqual reports whether two nodes are structurally identical
+// and can be skipped during diff. Two nodes are equal if they have the same
+// symbol, the same byte range, the same child count, and neither has been
+// marked as changed by Tree.Edit.
+func nodesStructurallyEqual(a, b *Node) bool {
+	if a.Symbol() != b.Symbol() {
+		return false
+	}
+	if a.StartByte() != b.StartByte() || a.EndByte() != b.EndByte() {
+		return false
+	}
+	if a.ChildCount() != b.ChildCount() {
+		return false
+	}
+	// Fast path: if neither node has changes, they're equal.
+	if !a.HasChanges() && !b.HasChanges() {
+		return true
+	}
+	return false
+}
+
+// addChangedRange records a changed range covering both the old and new node spans.
+func addChangedRange(oldNode, newNode *Node, ranges *[]Range) {
+	startByte := min(oldNode.StartByte(), newNode.StartByte())
+	endByte := max(oldNode.EndByte(), newNode.EndByte())
+	startPoint := oldNode.StartPoint()
+	endPoint := newNode.EndPoint()
+	if newNode.StartByte() < oldNode.StartByte() {
+		startPoint = newNode.StartPoint()
+	}
+	if oldNode.EndByte() > newNode.EndByte() {
+		endPoint = oldNode.EndPoint()
+	}
+	*ranges = append(*ranges, Range{
+		StartByte:  startByte,
+		EndByte:    endByte,
+		StartPoint: startPoint,
+		EndPoint:   endPoint,
+	})
+}

@@ -71,6 +71,10 @@ const (
 	predicateIsNot
 	predicateSet
 	predicateOffset
+	predicateAnyEq
+	predicateAnyNotEq
+	predicateAnyMatch
+	predicateAnyNotMatch
 )
 
 // QueryPredicate is a post-match constraint attached to a pattern.
@@ -84,6 +88,10 @@ const (
 //   - (#lua-match? @a "lua-pattern")
 //   - (#any-of? @a "v1" "v2" ...)
 //   - (#not-any-of? @a "v1" "v2" ...)
+//   - (#any-eq? @a "literal"), (#any-eq? @a @b)
+//   - (#any-not-eq? @a "literal"), (#any-not-eq? @a @b)
+//   - (#any-match? @a "regex")
+//   - (#any-not-match? @a "regex")
 //   - (#has-ancestor? @a type ...)
 //   - (#not-has-ancestor? @a type ...)
 //   - (#not-has-parent? @a type ...)
@@ -557,6 +565,92 @@ func (q *Query) matchesPredicates(predicates []QueryPredicate, captures []QueryC
 				return false
 			}
 			if pred.regex != nil && pred.regex.MatchString(left) {
+				return false
+			}
+
+		case predicateAnyEq:
+			nodes := captureNodes(pred.leftCapture, captures)
+			if len(nodes) == 0 {
+				return false
+			}
+			right := pred.literal
+			if pred.rightCapture != "" {
+				var ok bool
+				right, ok = captureText(pred.rightCapture, captures, source)
+				if !ok {
+					return false
+				}
+			}
+			found := false
+			for _, n := range nodes {
+				if n.Text(source) == right {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+
+		case predicateAnyNotEq:
+			nodes := captureNodes(pred.leftCapture, captures)
+			if len(nodes) == 0 {
+				return false
+			}
+			right := pred.literal
+			if pred.rightCapture != "" {
+				var ok bool
+				right, ok = captureText(pred.rightCapture, captures, source)
+				if !ok {
+					return false
+				}
+			}
+			found := false
+			for _, n := range nodes {
+				if n.Text(source) != right {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+
+		case predicateAnyMatch:
+			nodes := captureNodes(pred.leftCapture, captures)
+			if len(nodes) == 0 {
+				return false
+			}
+			if pred.regex == nil {
+				return false
+			}
+			found := false
+			for _, n := range nodes {
+				if pred.regex.MatchString(n.Text(source)) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+
+		case predicateAnyNotMatch:
+			nodes := captureNodes(pred.leftCapture, captures)
+			if len(nodes) == 0 {
+				return false
+			}
+			if pred.regex == nil {
+				return false
+			}
+			found := false
+			for _, n := range nodes {
+				if !pred.regex.MatchString(n.Text(source)) {
+					found = true
+					break
+				}
+			}
+			if !found {
 				return false
 			}
 
@@ -1882,6 +1976,140 @@ func (p *queryParser) parsePredicate() (QueryPredicate, error) {
 		}
 		return QueryPredicate{
 			kind:        predicateNotMatch,
+			leftCapture: left,
+			literal:     right,
+			regex:       rx,
+		}, nil
+
+	case "#any-eq?":
+		p.skipWhitespaceAndComments()
+		left, leftIsCapture, err := p.readPredicateArg()
+		if err != nil {
+			return QueryPredicate{}, err
+		}
+		if !leftIsCapture {
+			return QueryPredicate{}, fmt.Errorf("query: first predicate argument must be a capture in %s", name)
+		}
+
+		p.skipWhitespaceAndComments()
+		right, rightIsCapture, err := p.readPredicateArg()
+		if err != nil {
+			return QueryPredicate{}, err
+		}
+		p.skipWhitespaceAndComments()
+		if p.pos >= len(p.input) || p.input[p.pos] != ')' {
+			return QueryPredicate{}, fmt.Errorf("query: expected ')' to close predicate at position %d", p.pos)
+		}
+		p.pos++ // consume ')'
+
+		pred := QueryPredicate{
+			kind:        predicateAnyEq,
+			leftCapture: left,
+		}
+		if rightIsCapture {
+			pred.rightCapture = right
+		} else {
+			pred.literal = right
+		}
+		return pred, nil
+
+	case "#any-not-eq?":
+		p.skipWhitespaceAndComments()
+		left, leftIsCapture, err := p.readPredicateArg()
+		if err != nil {
+			return QueryPredicate{}, err
+		}
+		if !leftIsCapture {
+			return QueryPredicate{}, fmt.Errorf("query: first predicate argument must be a capture in %s", name)
+		}
+
+		p.skipWhitespaceAndComments()
+		right, rightIsCapture, err := p.readPredicateArg()
+		if err != nil {
+			return QueryPredicate{}, err
+		}
+		p.skipWhitespaceAndComments()
+		if p.pos >= len(p.input) || p.input[p.pos] != ')' {
+			return QueryPredicate{}, fmt.Errorf("query: expected ')' to close predicate at position %d", p.pos)
+		}
+		p.pos++ // consume ')'
+
+		pred := QueryPredicate{
+			kind:        predicateAnyNotEq,
+			leftCapture: left,
+		}
+		if rightIsCapture {
+			pred.rightCapture = right
+		} else {
+			pred.literal = right
+		}
+		return pred, nil
+
+	case "#any-match?":
+		p.skipWhitespaceAndComments()
+		left, leftIsCapture, err := p.readPredicateArg()
+		if err != nil {
+			return QueryPredicate{}, err
+		}
+		if !leftIsCapture {
+			return QueryPredicate{}, fmt.Errorf("query: first predicate argument must be a capture in %s", name)
+		}
+
+		p.skipWhitespaceAndComments()
+		right, rightIsCapture, err := p.readPredicateArg()
+		if err != nil {
+			return QueryPredicate{}, err
+		}
+		p.skipWhitespaceAndComments()
+		if p.pos >= len(p.input) || p.input[p.pos] != ')' {
+			return QueryPredicate{}, fmt.Errorf("query: expected ')' to close predicate at position %d", p.pos)
+		}
+		p.pos++ // consume ')'
+
+		if rightIsCapture {
+			return QueryPredicate{}, fmt.Errorf("query: #any-match? second argument must be a string literal")
+		}
+		rx, err := regexp.Compile(right)
+		if err != nil {
+			return QueryPredicate{}, fmt.Errorf("query: invalid regex in #any-match?: %w", err)
+		}
+		return QueryPredicate{
+			kind:        predicateAnyMatch,
+			leftCapture: left,
+			literal:     right,
+			regex:       rx,
+		}, nil
+
+	case "#any-not-match?":
+		p.skipWhitespaceAndComments()
+		left, leftIsCapture, err := p.readPredicateArg()
+		if err != nil {
+			return QueryPredicate{}, err
+		}
+		if !leftIsCapture {
+			return QueryPredicate{}, fmt.Errorf("query: first predicate argument must be a capture in %s", name)
+		}
+
+		p.skipWhitespaceAndComments()
+		right, rightIsCapture, err := p.readPredicateArg()
+		if err != nil {
+			return QueryPredicate{}, err
+		}
+		p.skipWhitespaceAndComments()
+		if p.pos >= len(p.input) || p.input[p.pos] != ')' {
+			return QueryPredicate{}, fmt.Errorf("query: expected ')' to close predicate at position %d", p.pos)
+		}
+		p.pos++ // consume ')'
+
+		if rightIsCapture {
+			return QueryPredicate{}, fmt.Errorf("query: #any-not-match? second argument must be a string literal")
+		}
+		rx, err := regexp.Compile(right)
+		if err != nil {
+			return QueryPredicate{}, fmt.Errorf("query: invalid regex in #any-not-match?: %w", err)
+		}
+		return QueryPredicate{
+			kind:        predicateAnyNotMatch,
 			leftCapture: left,
 			literal:     right,
 			regex:       rx,

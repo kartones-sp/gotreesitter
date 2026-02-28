@@ -1383,6 +1383,29 @@ func (d *dfaTokenSource) promoteKeyword(tok Token) Token {
 		return tok
 	}
 
+	// ABI 15: Check if keyword is reserved in this parse state.
+	if len(d.language.ReservedWords) > 0 && d.language.MaxReservedWordSetSize > 0 {
+		if int(d.state) < len(d.language.LexModes) {
+			rwSetID := d.language.LexModes[d.state].ReservedWordSetID
+			if rwSetID > 0 {
+				stride := int(d.language.MaxReservedWordSetSize)
+				start := int(rwSetID) * stride
+				end := start + stride
+				if end > len(d.language.ReservedWords) {
+					end = len(d.language.ReservedWords)
+				}
+				for i := start; i < end; i++ {
+					if d.language.ReservedWords[i] == 0 {
+						break
+					}
+					if d.language.ReservedWords[i] == kwTok.Symbol {
+						return tok // reserved — don't promote
+					}
+				}
+			}
+		}
+	}
+
 	// Context-aware promotion: only use the keyword symbol if the current
 	// parser state has a valid action for it. This prevents contextual
 	// keywords like "get"/"set" from being promoted in positions where

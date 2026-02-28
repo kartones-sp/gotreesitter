@@ -1,6 +1,7 @@
 package gotreesitter
 
 import (
+	"regexp"
 	"testing"
 )
 
@@ -2253,4 +2254,325 @@ func buildFieldedTree(lang *Language) *Tree {
 		[]*Node{funcDecl},
 		[]FieldID{0})
 	return NewTree(program, source, lang)
+}
+
+// ---------------------------------------------------------------------------
+// Quantified query predicates: #any-eq?, #any-not-eq?, #any-match?, #any-not-match?
+// ---------------------------------------------------------------------------
+
+// buildMultiIdentTree creates a tree with three identifier children under a block:
+//   program > block > [ identifier("foo"), identifier("bar"), identifier("baz") ]
+// source: "foo bar baz"
+func buildMultiIdentTree(lang *Language) *Tree {
+	source := []byte("foo bar baz")
+	id1 := leaf(Symbol(1), true, 0, 3)  // "foo"
+	id2 := leaf(Symbol(1), true, 4, 7)  // "bar"
+	id3 := leaf(Symbol(1), true, 8, 11) // "baz"
+	block := parent(Symbol(14), true,
+		[]*Node{id1, id2, id3},
+		[]FieldID{0, 0, 0})
+	program := parent(Symbol(7), true,
+		[]*Node{block},
+		[]FieldID{0})
+	return NewTree(program, source, lang)
+}
+
+// --- Parse tests ---
+
+func TestParsePredicateAnyEq(t *testing.T) {
+	lang := queryTestLanguage()
+	q, err := NewQuery(`(identifier) @name (#any-eq? @name "main")`, lang)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if len(q.patterns[0].predicates) != 1 {
+		t.Fatalf("predicates: got %d, want 1", len(q.patterns[0].predicates))
+	}
+	pred := q.patterns[0].predicates[0]
+	if pred.kind != predicateAnyEq {
+		t.Fatalf("predicate kind: got %d, want %d", pred.kind, predicateAnyEq)
+	}
+	if pred.leftCapture != "name" {
+		t.Fatalf("leftCapture: got %q, want %q", pred.leftCapture, "name")
+	}
+	if pred.literal != "main" {
+		t.Fatalf("literal: got %q, want %q", pred.literal, "main")
+	}
+}
+
+func TestParsePredicateAnyEqCapture(t *testing.T) {
+	lang := queryTestLanguage()
+	q, err := NewQuery(`(block (identifier) @a (identifier) @b (#any-eq? @a @b))`, lang)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if len(q.patterns[0].predicates) != 1 {
+		t.Fatalf("predicates: got %d, want 1", len(q.patterns[0].predicates))
+	}
+	pred := q.patterns[0].predicates[0]
+	if pred.kind != predicateAnyEq {
+		t.Fatalf("predicate kind: got %d, want %d", pred.kind, predicateAnyEq)
+	}
+	if pred.rightCapture != "b" {
+		t.Fatalf("rightCapture: got %q, want %q", pred.rightCapture, "b")
+	}
+}
+
+func TestParsePredicateAnyNotEq(t *testing.T) {
+	lang := queryTestLanguage()
+	q, err := NewQuery(`(identifier) @name (#any-not-eq? @name "main")`, lang)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	pred := q.patterns[0].predicates[0]
+	if pred.kind != predicateAnyNotEq {
+		t.Fatalf("predicate kind: got %d, want %d", pred.kind, predicateAnyNotEq)
+	}
+}
+
+func TestParsePredicateAnyMatch(t *testing.T) {
+	lang := queryTestLanguage()
+	q, err := NewQuery(`(identifier) @name (#any-match? @name "^ma")`, lang)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	pred := q.patterns[0].predicates[0]
+	if pred.kind != predicateAnyMatch {
+		t.Fatalf("predicate kind: got %d, want %d", pred.kind, predicateAnyMatch)
+	}
+	if pred.regex == nil {
+		t.Fatal("regex should not be nil")
+	}
+}
+
+func TestParsePredicateAnyNotMatch(t *testing.T) {
+	lang := queryTestLanguage()
+	q, err := NewQuery(`(identifier) @name (#any-not-match? @name "^z")`, lang)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	pred := q.patterns[0].predicates[0]
+	if pred.kind != predicateAnyNotMatch {
+		t.Fatalf("predicate kind: got %d, want %d", pred.kind, predicateAnyNotMatch)
+	}
+	if pred.regex == nil {
+		t.Fatal("regex should not be nil")
+	}
+}
+
+func TestParsePredicateAnyMatchRejectsCapture(t *testing.T) {
+	lang := queryTestLanguage()
+	_, err := NewQuery(`(block (identifier) @a (identifier) @b (#any-match? @a @b))`, lang)
+	if err == nil {
+		t.Fatal("expected error: #any-match? second argument must be a string literal")
+	}
+}
+
+func TestParsePredicateAnyNotMatchRejectsCapture(t *testing.T) {
+	lang := queryTestLanguage()
+	_, err := NewQuery(`(block (identifier) @a (identifier) @b (#any-not-match? @a @b))`, lang)
+	if err == nil {
+		t.Fatal("expected error: #any-not-match? second argument must be a string literal")
+	}
+}
+
+// --- Evaluation tests using matchesPredicates directly ---
+
+func TestAnyEqMatchesPredicates(t *testing.T) {
+	source := []byte("foo bar baz")
+	n1 := leaf(Symbol(1), true, 0, 3)  // "foo"
+	n2 := leaf(Symbol(1), true, 4, 7)  // "bar"
+	n3 := leaf(Symbol(1), true, 8, 11) // "baz"
+
+	captures := []QueryCapture{
+		{Name: "items", Node: n1},
+		{Name: "items", Node: n2},
+		{Name: "items", Node: n3},
+	}
+
+	q := &Query{}
+
+	// Should match: "bar" is among the captured nodes.
+	preds := []QueryPredicate{{
+		kind:        predicateAnyEq,
+		leftCapture: "items",
+		literal:     "bar",
+	}}
+	if !q.matchesPredicates(preds, captures, nil, source) {
+		t.Fatal("any-eq? should match when one node equals 'bar'")
+	}
+
+	// Should not match: "xyz" is not among the captured nodes.
+	preds[0].literal = "xyz"
+	if q.matchesPredicates(preds, captures, nil, source) {
+		t.Fatal("any-eq? should not match when no node equals 'xyz'")
+	}
+}
+
+func TestAnyEqCaptureVsCapture(t *testing.T) {
+	source := []byte("foo bar baz bar")
+	n1 := leaf(Symbol(1), true, 0, 3)   // "foo"
+	n2 := leaf(Symbol(1), true, 4, 7)   // "bar"
+	n3 := leaf(Symbol(1), true, 8, 11)  // "baz"
+	nRef := leaf(Symbol(1), true, 12, 15) // "bar"
+
+	captures := []QueryCapture{
+		{Name: "items", Node: n1},
+		{Name: "items", Node: n2},
+		{Name: "items", Node: n3},
+		{Name: "ref", Node: nRef},
+	}
+
+	q := &Query{}
+
+	// Should match: n2 ("bar") == nRef ("bar").
+	preds := []QueryPredicate{{
+		kind:         predicateAnyEq,
+		leftCapture:  "items",
+		rightCapture: "ref",
+	}}
+	if !q.matchesPredicates(preds, captures, nil, source) {
+		t.Fatal("any-eq? capture-vs-capture should match when one node matches")
+	}
+
+	// Change ref to "foo" — still should match (n1 == "foo").
+	nRef2 := leaf(Symbol(1), true, 0, 3) // "foo"
+	captures[3] = QueryCapture{Name: "ref", Node: nRef2}
+	if !q.matchesPredicates(preds, captures, nil, source) {
+		t.Fatal("any-eq? capture-vs-capture should match when first node matches")
+	}
+}
+
+func TestAnyNotEqMatchesPredicates(t *testing.T) {
+	source := []byte("bar bar bar")
+	n1 := leaf(Symbol(1), true, 0, 3) // "bar"
+	n2 := leaf(Symbol(1), true, 4, 7) // "bar"
+	n3 := leaf(Symbol(1), true, 8, 11) // "bar"
+
+	captures := []QueryCapture{
+		{Name: "items", Node: n1},
+		{Name: "items", Node: n2},
+		{Name: "items", Node: n3},
+	}
+
+	q := &Query{}
+
+	// All nodes are "bar", so any-not-eq? "bar" should NOT match (no node != "bar").
+	preds := []QueryPredicate{{
+		kind:        predicateAnyNotEq,
+		leftCapture: "items",
+		literal:     "bar",
+	}}
+	if q.matchesPredicates(preds, captures, nil, source) {
+		t.Fatal("any-not-eq? should not match when all nodes equal 'bar'")
+	}
+
+	// any-not-eq? "xyz" should match (all nodes != "xyz").
+	preds[0].literal = "xyz"
+	if !q.matchesPredicates(preds, captures, nil, source) {
+		t.Fatal("any-not-eq? should match when some node does not equal 'xyz'")
+	}
+}
+
+func TestAnyMatchMatchesPredicates(t *testing.T) {
+	source := []byte("foo bar baz")
+	n1 := leaf(Symbol(1), true, 0, 3)  // "foo"
+	n2 := leaf(Symbol(1), true, 4, 7)  // "bar"
+	n3 := leaf(Symbol(1), true, 8, 11) // "baz"
+
+	captures := []QueryCapture{
+		{Name: "items", Node: n1},
+		{Name: "items", Node: n2},
+		{Name: "items", Node: n3},
+	}
+
+	q := &Query{}
+	rx := mustCompileTestRegex(t, "^ba")
+
+	// Should match: "bar" and "baz" both match ^ba.
+	preds := []QueryPredicate{{
+		kind:        predicateAnyMatch,
+		leftCapture: "items",
+		regex:       rx,
+	}}
+	if !q.matchesPredicates(preds, captures, nil, source) {
+		t.Fatal("any-match? should match when at least one node matches ^ba")
+	}
+
+	// Should not match: nothing matches ^xyz.
+	rx2 := mustCompileTestRegex(t, "^xyz")
+	preds[0].regex = rx2
+	if q.matchesPredicates(preds, captures, nil, source) {
+		t.Fatal("any-match? should not match when no node matches ^xyz")
+	}
+}
+
+func TestAnyNotMatchMatchesPredicates(t *testing.T) {
+	source := []byte("bar baz")
+	n1 := leaf(Symbol(1), true, 0, 3) // "bar"
+	n2 := leaf(Symbol(1), true, 4, 7) // "baz"
+
+	captures := []QueryCapture{
+		{Name: "items", Node: n1},
+		{Name: "items", Node: n2},
+	}
+
+	q := &Query{}
+
+	// ^ba matches both "bar" and "baz", so any-not-match? ^ba should NOT match.
+	rx := mustCompileTestRegex(t, "^ba")
+	preds := []QueryPredicate{{
+		kind:        predicateAnyNotMatch,
+		leftCapture: "items",
+		regex:       rx,
+	}}
+	if q.matchesPredicates(preds, captures, nil, source) {
+		t.Fatal("any-not-match? should not match when all nodes match ^ba")
+	}
+
+	// ^bar matches "bar" but not "baz", so any-not-match? ^bar should match.
+	rx2 := mustCompileTestRegex(t, "^bar$")
+	preds[0].regex = rx2
+	if !q.matchesPredicates(preds, captures, nil, source) {
+		t.Fatal("any-not-match? should match when at least one node does not match ^bar$")
+	}
+}
+
+func TestAnyEqEmptyCaptures(t *testing.T) {
+	source := []byte("foo")
+	q := &Query{}
+
+	preds := []QueryPredicate{{
+		kind:        predicateAnyEq,
+		leftCapture: "missing",
+		literal:     "foo",
+	}}
+	if q.matchesPredicates(preds, nil, nil, source) {
+		t.Fatal("any-eq? should return false for empty captures")
+	}
+}
+
+func TestAnyMatchNilRegex(t *testing.T) {
+	source := []byte("foo")
+	n := leaf(Symbol(1), true, 0, 3)
+	captures := []QueryCapture{{Name: "x", Node: n}}
+	q := &Query{}
+
+	preds := []QueryPredicate{{
+		kind:        predicateAnyMatch,
+		leftCapture: "x",
+		regex:       nil,
+	}}
+	if q.matchesPredicates(preds, captures, nil, source) {
+		t.Fatal("any-match? with nil regex should return false")
+	}
+}
+
+func mustCompileTestRegex(t *testing.T, pattern string) *regexp.Regexp {
+	t.Helper()
+	rx, err := regexp.Compile(pattern)
+	if err != nil {
+		t.Fatalf("bad test regex %q: %v", pattern, err)
+	}
+	return rx
 }
