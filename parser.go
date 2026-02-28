@@ -2213,7 +2213,6 @@ func (p *Parser) applyReduceActionFromGSS(s *glrStack, act ParseAction, anyReduc
 		reducedEnd--
 	}
 
-	span := computeReduceRawSpan(windowEntries, 0, reducedEnd)
 	children, fieldIDs := p.buildReduceChildren(windowEntries, 0, reducedEnd, childCount, act.ProductionID, arena)
 
 	var trailingExtras []*Node
@@ -2251,6 +2250,7 @@ func (p *Parser) applyReduceActionFromGSS(s *glrStack, act ParseAction, anyReduc
 		shouldUseRawSpan = true
 	}
 	if shouldUseRawSpan && reducedEnd > 0 {
+		span := computeReduceRawSpan(windowEntries, 0, reducedEnd)
 		parent.startByte = span.startByte
 		parent.endByte = span.endByte
 		parent.startPoint = span.startPoint
@@ -2468,7 +2468,6 @@ func (p *Parser) applyReduceAction(s *glrStack, act ParseAction, anyReduced *boo
 		return
 	}
 
-	span := computeReduceRawSpan(entries, window.start, window.reducedEnd)
 	children, fieldIDs := p.buildReduceChildren(entries, window.start, window.reducedEnd, childCount, act.ProductionID, arena)
 
 	trailingStart := window.reducedEnd
@@ -2505,6 +2504,7 @@ func (p *Parser) applyReduceAction(s *glrStack, act ParseAction, anyReduced *boo
 		shouldUseRawSpan = true
 	}
 	if shouldUseRawSpan && window.reducedEnd > window.start {
+		span := computeReduceRawSpan(entries, window.start, window.reducedEnd)
 		parent.startByte = span.startByte
 		parent.endByte = span.endByte
 		parent.startPoint = span.startPoint
