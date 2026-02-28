@@ -1439,7 +1439,9 @@ func parseStackDepth(sourceLen int) int {
 // parseNodeLimit returns the maximum number of Node allocations allowed.
 // This is the hard ceiling that prevents OOM regardless of iteration count.
 func parseNodeLimit(sourceLen int) int {
-	limit := max(100_000, sourceLen*10)
+	// Keep the default budget high enough for large full-parse corpora so
+	// correctness gates can run without relying on external scale overrides.
+	limit := max(100_000, sourceLen*40)
 	scale := parseNodeLimitScaleFactor()
 	if scale <= 1 {
 		return limit
