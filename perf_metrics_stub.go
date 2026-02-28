@@ -11,6 +11,7 @@ type PerfCounters struct {
 	MergeReplacements      uint64
 	StackEquivalentCalls   uint64
 	StackEquivalentTrue    uint64
+	StackEqHashMissSkips   uint64
 	StackCompareCalls      uint64
 	ForkCount              uint64
 	FirstConflictToken     uint64
@@ -31,8 +32,12 @@ type PerfCounters struct {
 	ReuseNonLeafNoGotoNt   uint64
 	ReuseNonLeafStateMiss  uint64
 	ReuseNonLeafStateZero  uint64
+	MergeHashZero          uint64
+	GlobalCapCulls         uint64
+	GlobalCapCullDropped   uint64
 	MergeStacksInHist      [maxGLRStacks + 2]uint64
 	MergeAliveHist         [maxGLRStacks + 2]uint64
+	MergeOutHist           [maxGLRStacks + 2]uint64
 	ForkActionsHist        [8]uint64
 }
 
@@ -41,10 +46,14 @@ func PerfCountersSnapshot() PerfCounters { return PerfCounters{} }
 
 func perfRecordMergeCall(int)                  {}
 func perfRecordMergeAlive(int, int)            {}
+func perfRecordMergeOut(int)                   {}
+func perfRecordMergeHashZero()                 {}
+func perfRecordGlobalCapCull(int, int)         {}
 func perfRecordMergePerKeyOverflow()           {}
 func perfRecordMergeReplacement()              {}
 func perfRecordStackEquivalentCall()           {}
 func perfRecordStackEquivalentTrue()           {}
+func perfRecordStackEquivalentHashMissSkip()   {}
 func perfRecordStackCompare()                  {}
 func perfRecordFork(int, uint64)               {}
 func perfRecordMaxConcurrentStacks(int)        {}

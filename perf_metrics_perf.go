@@ -17,6 +17,7 @@ type perfCountersData struct {
 	mergeReplacements      atomic.Uint64
 	stackEquivalentCalls   atomic.Uint64
 	stackEquivalentTrue    atomic.Uint64
+	stackEqHashMissSkips   atomic.Uint64
 	stackCompareCalls      atomic.Uint64
 	forkCount              atomic.Uint64
 	firstConflictToken     atomic.Uint64
@@ -37,8 +38,12 @@ type perfCountersData struct {
 	reuseNonLeafNoGotoNt   atomic.Uint64
 	reuseNonLeafStateMiss  atomic.Uint64
 	reuseNonLeafStateZero  atomic.Uint64
+	mergeHashZero          atomic.Uint64
+	globalCapCulls         atomic.Uint64
+	globalCapCullDropped   atomic.Uint64
 	mergeStacksInHist      [perfMergeHistBins]atomic.Uint64
 	mergeAliveHist         [perfMergeHistBins]atomic.Uint64
+	mergeOutHist           [perfMergeHistBins]atomic.Uint64
 	forkActionsHist        [perfForkHistBins]atomic.Uint64
 }
 
@@ -51,6 +56,7 @@ type PerfCounters struct {
 	MergeReplacements      uint64
 	StackEquivalentCalls   uint64
 	StackEquivalentTrue    uint64
+	StackEqHashMissSkips   uint64
 	StackCompareCalls      uint64
 	ForkCount              uint64
 	FirstConflictToken     uint64
@@ -71,8 +77,12 @@ type PerfCounters struct {
 	ReuseNonLeafNoGotoNt   uint64
 	ReuseNonLeafStateMiss  uint64
 	ReuseNonLeafStateZero  uint64
+	MergeHashZero          uint64
+	GlobalCapCulls         uint64
+	GlobalCapCullDropped   uint64
 	MergeStacksInHist      [perfMergeHistBins]uint64
 	MergeAliveHist         [perfMergeHistBins]uint64
+	MergeOutHist           [perfMergeHistBins]uint64
 	ForkActionsHist        [perfForkHistBins]uint64
 }
 
@@ -83,6 +93,7 @@ func ResetPerfCounters() {
 	perfCounters.mergeReplacements.Store(0)
 	perfCounters.stackEquivalentCalls.Store(0)
 	perfCounters.stackEquivalentTrue.Store(0)
+	perfCounters.stackEqHashMissSkips.Store(0)
 	perfCounters.stackCompareCalls.Store(0)
 	perfCounters.forkCount.Store(0)
 	perfCounters.firstConflictToken.Store(0)
@@ -109,6 +120,12 @@ func ResetPerfCounters() {
 	for i := range perfCounters.mergeAliveHist {
 		perfCounters.mergeAliveHist[i].Store(0)
 	}
+	perfCounters.mergeHashZero.Store(0)
+	perfCounters.globalCapCulls.Store(0)
+	perfCounters.globalCapCullDropped.Store(0)
+	for i := range perfCounters.mergeOutHist {
+		perfCounters.mergeOutHist[i].Store(0)
+	}
 	for i := range perfCounters.forkActionsHist {
 		perfCounters.forkActionsHist[i].Store(0)
 	}
@@ -122,6 +139,7 @@ func PerfCountersSnapshot() PerfCounters {
 	out.MergeReplacements = perfCounters.mergeReplacements.Load()
 	out.StackEquivalentCalls = perfCounters.stackEquivalentCalls.Load()
 	out.StackEquivalentTrue = perfCounters.stackEquivalentTrue.Load()
+	out.StackEqHashMissSkips = perfCounters.stackEqHashMissSkips.Load()
 	out.StackCompareCalls = perfCounters.stackCompareCalls.Load()
 	out.ForkCount = perfCounters.forkCount.Load()
 	out.FirstConflictToken = perfCounters.firstConflictToken.Load()
@@ -148,6 +166,12 @@ func PerfCountersSnapshot() PerfCounters {
 	for i := range out.MergeAliveHist {
 		out.MergeAliveHist[i] = perfCounters.mergeAliveHist[i].Load()
 	}
+	out.MergeHashZero = perfCounters.mergeHashZero.Load()
+	out.GlobalCapCulls = perfCounters.globalCapCulls.Load()
+	out.GlobalCapCullDropped = perfCounters.globalCapCullDropped.Load()
+	for i := range out.MergeOutHist {
+		out.MergeOutHist[i] = perfCounters.mergeOutHist[i].Load()
+	}
 	for i := range out.ForkActionsHist {
 		out.ForkActionsHist[i] = perfCounters.forkActionsHist[i].Load()
 	}
@@ -166,6 +190,21 @@ func perfRecordMergeAlive(alive, dead int) {
 	perfCounters.mergeAliveHist[perfMergeHistBin(alive)].Add(1)
 }
 
+func perfRecordMergeOut(stacksOut int) {
+	perfCounters.mergeOutHist[perfMergeHistBin(stacksOut)].Add(1)
+}
+
+func perfRecordMergeHashZero() {
+	perfCounters.mergeHashZero.Add(1)
+}
+
+func perfRecordGlobalCapCull(before, cap int) {
+	perfCounters.globalCapCulls.Add(1)
+	if before > cap {
+		perfCounters.globalCapCullDropped.Add(uint64(before - cap))
+	}
+}
+
 func perfRecordMergePerKeyOverflow() {
 	perfCounters.mergePerKeyOverflow.Add(1)
 }
@@ -180,6 +219,10 @@ func perfRecordStackEquivalentCall() {
 
 func perfRecordStackEquivalentTrue() {
 	perfCounters.stackEquivalentTrue.Add(1)
+}
+
+func perfRecordStackEquivalentHashMissSkip() {
+	perfCounters.stackEqHashMissSkips.Add(1)
 }
 
 func perfRecordStackCompare() {

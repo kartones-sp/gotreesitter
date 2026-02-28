@@ -737,6 +737,17 @@ func extractFieldMapSlices(source string, g *ExtractedGrammar) ([][2]uint16, err
 }
 
 // extractFieldMapEntries parses ts_field_map[].
+//
+// C tree-sitter uses designated initializers with continuation entries:
+//
+//	[3] =
+//	    {field_operand, 1},
+//	    {field_operator, 0},   // continuation at index 4
+//	[5] =
+//	    {field_value, 1},
+//
+// We scan all {entry} blocks in source order, using [N]= markers to set
+// the current index and auto-incrementing for continuation entries.
 func extractFieldMapEntries(source string, g *ExtractedGrammar) ([]FieldMapEntry, error) {
 	// Modern tree-sitter generators use "ts_field_map_entries"; older
 	// generators (and our test fixture) used plain "ts_field_map".
@@ -748,47 +759,65 @@ func extractFieldMapEntries(source string, g *ExtractedGrammar) ([]FieldMapEntry
 		}
 	}
 
-	// Map entries by their array index first.
 	type idxEntry struct {
 		idx   int
 		entry FieldMapEntry
 	}
 
-	var parsed []idxEntry
-	maxIdx := -1
-
-	// Explicit indexed entries: [N] = {...}
-	indexedRe := regexp.MustCompile(`\[(\w+)\]\s*=\s*\{([^}]*)\}`)
-	indexedMatches := indexedRe.FindAllStringSubmatch(body, -1)
-
-	for _, m := range indexedMatches {
-		idx, ok := parseFieldMapIndex(g, m[1])
-		if !ok {
-			continue
-		}
-		entry, ok := parseFieldMapEntry(g, m[2])
-		if !ok {
-			continue
-		}
-		parsed = append(parsed, idxEntry{idx: idx, entry: entry})
-		if idx > maxIdx {
-			maxIdx = idx
+	// Build a sorted list of (position, index) for designator markers.
+	designatorRe := regexp.MustCompile(`\[(\w+)\]\s*=`)
+	designatorLocs := designatorRe.FindAllStringSubmatchIndex(body, -1)
+	type posIdx struct {
+		pos int
+		idx int
+	}
+	var designators []posIdx
+	for _, loc := range designatorLocs {
+		token := body[loc[2]:loc[3]]
+		idx, ok := parseFieldMapIndex(g, token)
+		if ok {
+			designators = append(designators, posIdx{pos: loc[0], idx: idx})
 		}
 	}
+	// designators are already in source order from FindAll.
 
-	// Sequential fallback if no indexed initializer entries.
-	if len(parsed) == 0 {
-		entryRe := regexp.MustCompile(`\{([^{}]+)\}`)
-		for i, m := range entryRe.FindAllStringSubmatch(body, -1) {
-			entry, ok := parseFieldMapEntry(g, m[1])
-			if !ok {
-				continue
+	// Scan all {entry} blocks in order, tracking current index.
+	// When a designator [N]= appears before an entry, reset curIdx to N.
+	// Otherwise, auto-increment for continuation entries.
+	entryRe := regexp.MustCompile(`\{([^{}]+)\}`)
+	entryLocs := entryRe.FindAllStringSubmatchIndex(body, -1)
+
+	var parsed []idxEntry
+	maxIdx := -1
+	curIdx := 0
+	prevEntryEnd := 0 // byte position after the last processed entry
+	dNext := 0        // next designator to consider
+
+	for _, loc := range entryLocs {
+		entryStart := loc[0]
+		entryBody := body[loc[2]:loc[3]]
+
+		// Consume any designator that falls between the previous entry's
+		// end and this entry's start. Use the last such designator.
+		for dNext < len(designators) && designators[dNext].pos < entryStart {
+			if designators[dNext].pos >= prevEntryEnd {
+				curIdx = designators[dNext].idx
 			}
-			parsed = append(parsed, idxEntry{idx: i, entry: entry})
-			if i > maxIdx {
-				maxIdx = i
-			}
+			dNext++
 		}
+
+		entry, ok := parseFieldMapEntry(g, entryBody)
+		if !ok {
+			curIdx++
+			prevEntryEnd = loc[1]
+			continue
+		}
+		parsed = append(parsed, idxEntry{idx: curIdx, entry: entry})
+		if curIdx > maxIdx {
+			maxIdx = curIdx
+		}
+		curIdx++
+		prevEntryEnd = loc[1]
 	}
 
 	if maxIdx < 0 {

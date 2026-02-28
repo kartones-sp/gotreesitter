@@ -76,7 +76,7 @@ func TestCorrectnessSnapshots(t *testing.T) {
 			t.Cleanup(func() { UnloadEmbeddedLanguage(entry.Name + ".bin") })
 			lang := entry.Language()
 			report := EvaluateParseSupport(entry, lang)
-			sample := parseSmokeSample(name)
+			sample := ParseSmokeSample(name)
 			parser := gotreesitter.NewParser(lang)
 			src := []byte(sample)
 

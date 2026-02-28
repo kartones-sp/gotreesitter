@@ -15,6 +15,21 @@ func cTreeSitterPointAtOffset(src []byte, offset int) sitter.Point {
 	return sitter.Point{Row: p.Row, Column: p.Column}
 }
 
+func requireCompleteCTree(tb testing.TB, tree *sitter.Tree, src []byte, phase string) *sitter.Node {
+	tb.Helper()
+	if tree == nil {
+		tb.Fatalf("%s parse returned nil tree", phase)
+	}
+	root := tree.RootNode()
+	if root == nil {
+		tb.Fatalf("%s parse returned nil root", phase)
+	}
+	if got, want := uint32(root.EndByte()), uint32(len(src)); got != want {
+		tb.Fatalf("%s parse truncated: root.EndByte=%d want=%d type=%q hasError=%v", phase, got, want, root.Type(), root.HasError())
+	}
+	return root
+}
+
 func newCTreeSitterParser(tb testing.TB) *sitter.Parser {
 	tb.Helper()
 	parser := sitter.NewParser()
@@ -36,9 +51,7 @@ func BenchmarkCTreeSitterGoParseFull(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		tree := parser.Parse(nil, src)
-		if tree == nil || tree.RootNode() == nil {
-			b.Fatal("parse returned nil root")
-		}
+		requireCompleteCTree(b, tree, src, "c full")
 		tree.Close()
 	}
 }

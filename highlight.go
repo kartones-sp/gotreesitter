@@ -81,10 +81,13 @@ func (h *Highlighter) Highlight(source []byte) []HighlightRange {
 	}
 
 	tree := h.parse(source, nil)
-
-	if tree.RootNode() == nil {
+	if tree == nil || tree.RootNode() == nil {
+		if tree != nil {
+			tree.Release()
+		}
 		return nil
 	}
+	defer tree.Release()
 
 	return h.highlightTree(tree)
 }
