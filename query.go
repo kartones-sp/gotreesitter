@@ -11,6 +11,7 @@ import (
 // Query holds compiled patterns parsed from a tree-sitter .scm query file.
 // It can be executed against a syntax tree to find matching nodes and
 // return captured names.
+// Query is safe for concurrent use after construction.
 type Query struct {
 	patterns []Pattern
 	captures []string // capture name by index
@@ -166,6 +167,7 @@ func (e queryUnknownNodeTypeError) Error() string {
 // QueryCursor incrementally walks a node subtree and yields matches one by one.
 // It is the streaming counterpart to Query.Execute and avoids materializing all
 // matches up front.
+// QueryCursor is not safe for concurrent use.
 type QueryCursor struct {
 	query  *Query
 	lang   *Language

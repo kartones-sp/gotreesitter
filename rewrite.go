@@ -8,6 +8,7 @@ import (
 // Rewriter collects source-text edits and applies them atomically.
 // Edits target byte ranges (usually from Node.StartByte/EndByte).
 // Apply returns new source bytes and InputEdit records for incremental reparsing.
+// Rewriter is not safe for concurrent use.
 type Rewriter struct {
 	source []byte
 	edits  []rewriteEdit

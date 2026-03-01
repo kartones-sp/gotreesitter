@@ -30,8 +30,9 @@ type gssNodeSlab struct {
 
 const (
 	// 64-bit FNV-1a constants.
-	gssHashSeed  uint64 = 1469598103934665603
-	gssHashPrime uint64 = 1099511628211
+	gssHashSeed        uint64 = 1469598103934665603
+	gssHashPrime       uint64 = 1099511628211
+	gssNilNodeSentinel uint64 = 0xff51afd7ed558ccd
 )
 
 func gssEntryHash(prev uint64, entry stackEntry) uint64 {
@@ -40,7 +41,7 @@ func gssEntryHash(prev uint64, entry stackEntry) uint64 {
 
 	n := entry.node
 	if n == nil {
-		h ^= 0xff51afd7ed558ccd
+		h ^= gssNilNodeSentinel
 		h *= gssHashPrime
 		return h
 	}
@@ -163,6 +164,8 @@ func (s gssStack) materialize(dst []stackEntry) []stackEntry {
 		i--
 	}
 	if i >= 0 {
+		// Invariant violation: depth metadata does not match linked-list length.
+		// This indicates internal GSS corruption and is not recoverable here.
 		panic("gssStack.materialize: corrupt depth metadata")
 	}
 	return dst

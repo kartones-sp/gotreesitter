@@ -31,7 +31,6 @@ const (
 	// on warm edit/full-parse workloads.
 	maxRetainedIncrementalNodeCap = 1 * 1024 * 1024
 	maxRetainedFullNodeCap        = 2 * 1024 * 1024
-
 )
 
 type arenaClass uint8
@@ -344,6 +343,8 @@ func (a *nodeArena) ensureNodeCapacity(min int) {
 		return
 	}
 	if a.used > 0 {
+		// Pre-sizing is only valid before the arena starts serving allocations.
+		// Calling this after allocation begins is an internal usage bug.
 		panic("ensureNodeCapacity called after arena allocations started")
 	}
 	newCap := len(a.nodes)

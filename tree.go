@@ -520,6 +520,8 @@ func newParentNodeInArena(arena *nodeArena, sym Symbol, named bool, children []*
 }
 
 // Tree holds a complete syntax tree along with its source text and language.
+// Tree is safe for concurrent reads after construction. Edit and Release are
+// not safe for concurrent use.
 type Tree struct {
 	root          *Node
 	source        []byte
