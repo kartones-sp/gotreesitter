@@ -200,66 +200,57 @@ for _, tag := range tags {
 
 ## Benchmarks
 
-All measurements below use the same workload: a Go source file containing 500 function definitions (~19 KB). Three runtimes are compared:
+All measurements below use the same workload: a generated Go source file with 500 functions (`19294` bytes).
+Numbers are medians from 10 runs on:
 
-1. **Native C** — tree-sitter compiled with `-O3`, linked directly, no Go involved. This is the hardware floor.
-2. **CGo binding** — [`go-tree-sitter`](https://github.com/smacker/go-tree-sitter), calling the same C runtime through `cgo`.
-3. **gotreesitter** — this project, pure Go.
-
+```text
+goos: linux
+goarch: amd64
+cpu: Intel(R) Core(TM) Ultra 9 285
 ```
-goos: linux / goarch: amd64 / cpu: Intel(R) Core(TM) Ultra 9 285
-```
 
-### Full parse (cold, no prior tree)
+| Runtime | Full parse | Incremental (1-byte edit) | Incremental (no edit) |
+|---|---:|---:|---:|
+| Native C (pure C runtime) | 1.76 ms | 101.7 μs | 100.4 μs |
+| CGo binding (C runtime via cgo) | 1.98 ms | 128.8 μs | 124.5 μs |
+| gotreesitter (pure Go) | 6.77 ms | 2.43 μs | 2.05 ns |
 
-| Runtime | Time | Relative |
-|---|---:|---:|
-| Native C (`-O3`) | 1.75 ms | 1.0x |
-| CGo binding | 1.95 ms | 1.1x |
-| gotreesitter | 19.2 ms | 11.0x |
+On this workload:
 
-gotreesitter's full parse is roughly an order of magnitude slower than the C runtime. The primary cost is the GLR parse loop: gotreesitter uses a generalized LR parser that explores multiple parse alternatives on ambiguous grammars, where the C runtime uses a deterministic LR parser with hand-tuned recovery. The Go implementation also pays for bounds checking, interface dispatch on the token source, and GC write barriers on node allocation. This is the expected cost of a pure-Go reimplementation — there is no trick that closes this gap without reintroducing C.
-
-### Incremental reparse (warm, prior tree available)
-
-| Workload | Native C | CGo binding | gotreesitter | vs. native C |
-|---|---:|---:|---:|---:|
-| 1-byte edit | 104 μs | 119 μs | 1.0 μs | **104x faster** |
-| No-op reparse | 101 μs | 115 μs | 2.4 ns | **42,000x faster** |
-
-Incremental parsing is where the architecture diverges. The C runtime and CGo binding must re-enter the parser on every call, even when nothing has changed — the C API provides no mechanism to short-circuit a no-op. gotreesitter holds the full tree in Go-managed memory. On a no-op reparse, a nil-pointer check on the edit list exits immediately. On a 1-byte edit, the parser walks the tree spine to the edit site, re-lexes only the affected tokens, and splices the result back in, reusing all unmodified subtrees by reference.
-
-For editor-class workloads (keystroke-at-a-time on a single file), incremental performance dominates total latency. A sub-microsecond reparse on every keystroke is effectively free at 60 fps.
+- Full parse is ~3.9x slower than native C (~3.4x slower than CGo).
+- Incremental single-byte edits are ~41.9x faster than native C (~53.1x faster than CGo).
+- No-edit reparses are ~49kx faster than native C (~61kx faster than CGo).
 
 <details>
 <summary>Raw benchmark output</summary>
 
 ```sh
-# Pure Go benchmarks:
-go test -run '^$' -bench 'BenchmarkGoParse' -benchmem -count=3
+# Pure Go (this repo):
+GOMAXPROCS=1 go test . -run '^$' \
+  -bench 'BenchmarkGoParseFullDFA|BenchmarkGoParseIncrementalSingleByteEditDFA|BenchmarkGoParseIncrementalNoEditDFA' \
+  -benchmem -count=10 -benchtime=750ms
 
 # CGo binding benchmarks:
 cd cgo_harness
-go test . -run '^$' -tags treesitter_c_bench -bench 'BenchmarkCTreeSitterGoParse' -benchmem -count=3
+GOMAXPROCS=1 go test . -run '^$' -tags treesitter_c_bench \
+  -bench 'BenchmarkCTreeSitterGoParseFull|BenchmarkCTreeSitterGoParseIncrementalSingleByteEdit|BenchmarkCTreeSitterGoParseIncrementalNoEdit' \
+  -benchmem -count=10 -benchtime=750ms
 
 # Native C benchmarks (no Go, direct C binary):
-bash cgo_harness/pure_c/run_go_benchmark.sh 500 2000 20000
+./pure_c/run_go_benchmark.sh 500 2000 20000
 ```
 
-| Benchmark | ns/op | B/op | allocs/op |
+| Benchmark | Median ns/op | B/op | allocs/op |
 |---|---:|---:|---:|
-| Native C full parse | 1,748,000 | — | — |
-| Native C incremental (1-byte edit) | 104,300 | — | — |
-| Native C incremental (no-op) | 100,900 | — | — |
-| `CTreeSitterGoParseFull` | 1,946,000 | 600 | 6 |
-| `CTreeSitterGoParseIncrementalSingleByteEdit` | 119,100 | 648 | 7 |
-| `CTreeSitterGoParseIncrementalNoEdit` | 114,900 | 600 | 6 |
-| `GoParseFull` | 19,270,000 | 7,645 | 1,226 |
-| `GoParseFullDFA` | 19,920,000 | 2,636 | 6 |
-| `GoParseIncrementalSingleByteEdit` | 1,000 | 424 | 8 |
-| `GoParseIncrementalSingleByteEditDFA` | 1,335 | 629 | 10 |
-| `GoParseIncrementalNoEdit` | 6.88 | 0 | 0 |
-| `GoParseIncrementalNoEditDFA` | 2.36 | 0 | 0 |
+| Native C full parse | 1,756,526 | — | — |
+| Native C incremental (1-byte edit) | 101,732 | — | — |
+| Native C incremental (no edit) | 100,385 | — | — |
+| `CTreeSitterGoParseFull` | 1,975,322 | 600 | 6 |
+| `CTreeSitterGoParseIncrementalSingleByteEdit` | 128,830 | 648 | 7 |
+| `CTreeSitterGoParseIncrementalNoEdit` | 124,548 | 600 | 6 |
+| `GoParseFullDFA` | 6,765,290 | 425 | 5 |
+| `GoParseIncrementalSingleByteEditDFA` | 2,426 | 496 | 9 |
+| `GoParseIncrementalNoEditDFA` | 2.045 | 0 | 0 |
 
 </details>
 
@@ -327,7 +318,7 @@ All shipped highlight and tags queries compile (`156/156` highlight, `69/69` tag
 
 ## Known limitations
 
-- **Full-parse throughput**: ~11x slower than the C runtime on the Go grammar benchmark. The GLR parse loop, Go bounds checking, interface dispatch, and GC write barriers account for the gap. Incremental reparsing amortizes this for interactive use.
+- **Full-parse throughput**: still slower than the C runtime on cold full parses (currently ~3.9x on the 500-function Go benchmark). Incremental reparsing amortizes this for editor-style workloads.
 - **GLR safety caps**: The parser enforces iteration, stack depth, and node count limits proportional to input size. These prevent pathological blowup on grammars with high ambiguity but impose a ceiling on the maximum input complexity that parses without error. The caps are tunable but not removable without risking unbounded resource consumption.
 - **Degraded grammars**: 3 of 206 grammars are currently degraded: `disassembly`, `norg`, and `vimdoc`. Check `entry.Quality` and `tree.RootNode().HasError()`.
 
@@ -431,6 +422,18 @@ GOT_PARSE_NODE_LIMIT_SCALE=3
 
 ```sh
 go test ./... -race -count=1
+```
+
+Correctness/parity gate commands used in CI and performance work:
+
+```sh
+# Top-50 smoke correctness
+go test ./grammars -run '^TestTop50ParseSmokeNoErrors$' -count=1 -v
+
+# C-oracle parity suites
+cd cgo_harness
+go test . -tags treesitter_c_parity -run '^TestParityFreshParse$|^TestParityHasNoErrors$|^TestParityIssue3Repros$|^TestParityGLRCanaryGo$' -count=1 -v
+go test . -tags treesitter_c_parity -run '^TestParityCorpusFreshParse$' -count=1 -v
 ```
 
 Test suite covers: smoke tests (206 grammars), golden S-expression snapshots, highlight query validation, query pattern matching, incremental reparse correctness, error recovery, GLR fork/merge, injection parsing, source rewriting, and fuzz targets.
