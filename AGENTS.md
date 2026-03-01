@@ -65,6 +65,8 @@ Use profiled runs to decide whether the next win comes from:
 ### 7) Gate Presets
 Correctness preset:
 - `go test ./...`
+- `go test ./grammars -run '^TestTop50ParseSmokeNoErrors$' -count=1 -v`
+- `cd cgo_harness && go test . -tags treesitter_c_parity -run '^TestParityFreshParse$|^TestParityHasNoErrors$|^TestParityIssue3Repros$|^TestParityGLRCanaryGo$' -count=1 -v`
 - `cd cgo_harness && go test . -tags treesitter_c_parity -run '^TestParityCorpusFreshParse$' -count=1 -v`
 
 Perf preset (stable settings):

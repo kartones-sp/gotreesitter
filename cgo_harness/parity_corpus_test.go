@@ -12,7 +12,6 @@ import (
 
 var unstableParityCorpusLangs = map[string]string{
 	"html": "html corpus parity is under active scanner investigation",
-	"yaml": "yaml corpus parity is under active scanner investigation",
 }
 
 type parityCorpusDoc struct {

@@ -43,11 +43,11 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: CGo Parity Gate (Go/Python/TSX + Issue Repros)
+      - name: CGo Parity Gate (Lock-Backed Set + Issue Repros + GLR Canary)
         run: |
           cd cgo_harness
           go test . -tags treesitter_c_parity \
-            -run 'TestParityFreshParse/(go|python)$|TestParityHasNoErrors/(go|python|tsx)$|TestParityIssue3Repros/go$' \
+            -run '^TestParityFreshParse$|^TestParityHasNoErrors$|^TestParityIssue3Repros$|^TestParityGLRCanaryGo$' \
             -count=1 -v
 
   perf-regression:
