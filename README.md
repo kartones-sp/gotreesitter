@@ -448,6 +448,8 @@ Next:
 - Port norg external scanner
 - Fuzz coverage expansion
 
+Release history and retroactive notes are tracked in [CHANGELOG.md](CHANGELOG.md).
+
 ## License
 
 [MIT](LICENSE)
