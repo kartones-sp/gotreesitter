@@ -1,6 +1,7 @@
 package gotreesitter
 
 import (
+	"regexp"
 	"testing"
 )
 
@@ -2253,4 +2254,740 @@ func buildFieldedTree(lang *Language) *Tree {
 		[]*Node{funcDecl},
 		[]FieldID{0})
 	return NewTree(program, source, lang)
+}
+
+// ---------------------------------------------------------------------------
+// Quantified query predicates: #any-eq?, #any-not-eq?, #any-match?, #any-not-match?
+// ---------------------------------------------------------------------------
+
+// buildMultiIdentTree creates a tree with three identifier children under a block:
+//   program > block > [ identifier("foo"), identifier("bar"), identifier("baz") ]
+// source: "foo bar baz"
+func buildMultiIdentTree(lang *Language) *Tree {
+	source := []byte("foo bar baz")
+	id1 := leaf(Symbol(1), true, 0, 3)  // "foo"
+	id2 := leaf(Symbol(1), true, 4, 7)  // "bar"
+	id3 := leaf(Symbol(1), true, 8, 11) // "baz"
+	block := parent(Symbol(14), true,
+		[]*Node{id1, id2, id3},
+		[]FieldID{0, 0, 0})
+	program := parent(Symbol(7), true,
+		[]*Node{block},
+		[]FieldID{0})
+	return NewTree(program, source, lang)
+}
+
+// --- Parse tests ---
+
+func TestParsePredicateAnyEq(t *testing.T) {
+	lang := queryTestLanguage()
+	q, err := NewQuery(`(identifier) @name (#any-eq? @name "main")`, lang)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if len(q.patterns[0].predicates) != 1 {
+		t.Fatalf("predicates: got %d, want 1", len(q.patterns[0].predicates))
+	}
+	pred := q.patterns[0].predicates[0]
+	if pred.kind != predicateAnyEq {
+		t.Fatalf("predicate kind: got %d, want %d", pred.kind, predicateAnyEq)
+	}
+	if pred.leftCapture != "name" {
+		t.Fatalf("leftCapture: got %q, want %q", pred.leftCapture, "name")
+	}
+	if pred.literal != "main" {
+		t.Fatalf("literal: got %q, want %q", pred.literal, "main")
+	}
+}
+
+func TestParsePredicateAnyEqCapture(t *testing.T) {
+	lang := queryTestLanguage()
+	q, err := NewQuery(`(block (identifier) @a (identifier) @b (#any-eq? @a @b))`, lang)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if len(q.patterns[0].predicates) != 1 {
+		t.Fatalf("predicates: got %d, want 1", len(q.patterns[0].predicates))
+	}
+	pred := q.patterns[0].predicates[0]
+	if pred.kind != predicateAnyEq {
+		t.Fatalf("predicate kind: got %d, want %d", pred.kind, predicateAnyEq)
+	}
+	if pred.rightCapture != "b" {
+		t.Fatalf("rightCapture: got %q, want %q", pred.rightCapture, "b")
+	}
+}
+
+func TestParsePredicateAnyNotEq(t *testing.T) {
+	lang := queryTestLanguage()
+	q, err := NewQuery(`(identifier) @name (#any-not-eq? @name "main")`, lang)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	pred := q.patterns[0].predicates[0]
+	if pred.kind != predicateAnyNotEq {
+		t.Fatalf("predicate kind: got %d, want %d", pred.kind, predicateAnyNotEq)
+	}
+}
+
+func TestParsePredicateAnyMatch(t *testing.T) {
+	lang := queryTestLanguage()
+	q, err := NewQuery(`(identifier) @name (#any-match? @name "^ma")`, lang)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	pred := q.patterns[0].predicates[0]
+	if pred.kind != predicateAnyMatch {
+		t.Fatalf("predicate kind: got %d, want %d", pred.kind, predicateAnyMatch)
+	}
+	if pred.regex == nil {
+		t.Fatal("regex should not be nil")
+	}
+}
+
+func TestParsePredicateAnyNotMatch(t *testing.T) {
+	lang := queryTestLanguage()
+	q, err := NewQuery(`(identifier) @name (#any-not-match? @name "^z")`, lang)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	pred := q.patterns[0].predicates[0]
+	if pred.kind != predicateAnyNotMatch {
+		t.Fatalf("predicate kind: got %d, want %d", pred.kind, predicateAnyNotMatch)
+	}
+	if pred.regex == nil {
+		t.Fatal("regex should not be nil")
+	}
+}
+
+func TestParsePredicateAnyMatchRejectsCapture(t *testing.T) {
+	lang := queryTestLanguage()
+	_, err := NewQuery(`(block (identifier) @a (identifier) @b (#any-match? @a @b))`, lang)
+	if err == nil {
+		t.Fatal("expected error: #any-match? second argument must be a string literal")
+	}
+}
+
+func TestParsePredicateAnyNotMatchRejectsCapture(t *testing.T) {
+	lang := queryTestLanguage()
+	_, err := NewQuery(`(block (identifier) @a (identifier) @b (#any-not-match? @a @b))`, lang)
+	if err == nil {
+		t.Fatal("expected error: #any-not-match? second argument must be a string literal")
+	}
+}
+
+// --- Evaluation tests using matchesPredicates directly ---
+
+func TestAnyEqMatchesPredicates(t *testing.T) {
+	source := []byte("foo bar baz")
+	n1 := leaf(Symbol(1), true, 0, 3)  // "foo"
+	n2 := leaf(Symbol(1), true, 4, 7)  // "bar"
+	n3 := leaf(Symbol(1), true, 8, 11) // "baz"
+
+	captures := []QueryCapture{
+		{Name: "items", Node: n1},
+		{Name: "items", Node: n2},
+		{Name: "items", Node: n3},
+	}
+
+	q := &Query{}
+
+	// Should match: "bar" is among the captured nodes.
+	preds := []QueryPredicate{{
+		kind:        predicateAnyEq,
+		leftCapture: "items",
+		literal:     "bar",
+	}}
+	if !q.matchesPredicates(preds, captures, nil, source) {
+		t.Fatal("any-eq? should match when one node equals 'bar'")
+	}
+
+	// Should not match: "xyz" is not among the captured nodes.
+	preds[0].literal = "xyz"
+	if q.matchesPredicates(preds, captures, nil, source) {
+		t.Fatal("any-eq? should not match when no node equals 'xyz'")
+	}
+}
+
+func TestAnyEqCaptureVsCapture(t *testing.T) {
+	source := []byte("foo bar baz bar")
+	n1 := leaf(Symbol(1), true, 0, 3)   // "foo"
+	n2 := leaf(Symbol(1), true, 4, 7)   // "bar"
+	n3 := leaf(Symbol(1), true, 8, 11)  // "baz"
+	nRef := leaf(Symbol(1), true, 12, 15) // "bar"
+
+	captures := []QueryCapture{
+		{Name: "items", Node: n1},
+		{Name: "items", Node: n2},
+		{Name: "items", Node: n3},
+		{Name: "ref", Node: nRef},
+	}
+
+	q := &Query{}
+
+	// Should match: n2 ("bar") == nRef ("bar").
+	preds := []QueryPredicate{{
+		kind:         predicateAnyEq,
+		leftCapture:  "items",
+		rightCapture: "ref",
+	}}
+	if !q.matchesPredicates(preds, captures, nil, source) {
+		t.Fatal("any-eq? capture-vs-capture should match when one node matches")
+	}
+
+	// Change ref to "foo" — still should match (n1 == "foo").
+	nRef2 := leaf(Symbol(1), true, 0, 3) // "foo"
+	captures[3] = QueryCapture{Name: "ref", Node: nRef2}
+	if !q.matchesPredicates(preds, captures, nil, source) {
+		t.Fatal("any-eq? capture-vs-capture should match when first node matches")
+	}
+}
+
+func TestAnyNotEqMatchesPredicates(t *testing.T) {
+	source := []byte("bar bar bar")
+	n1 := leaf(Symbol(1), true, 0, 3) // "bar"
+	n2 := leaf(Symbol(1), true, 4, 7) // "bar"
+	n3 := leaf(Symbol(1), true, 8, 11) // "bar"
+
+	captures := []QueryCapture{
+		{Name: "items", Node: n1},
+		{Name: "items", Node: n2},
+		{Name: "items", Node: n3},
+	}
+
+	q := &Query{}
+
+	// All nodes are "bar", so any-not-eq? "bar" should NOT match (no node != "bar").
+	preds := []QueryPredicate{{
+		kind:        predicateAnyNotEq,
+		leftCapture: "items",
+		literal:     "bar",
+	}}
+	if q.matchesPredicates(preds, captures, nil, source) {
+		t.Fatal("any-not-eq? should not match when all nodes equal 'bar'")
+	}
+
+	// any-not-eq? "xyz" should match (all nodes != "xyz").
+	preds[0].literal = "xyz"
+	if !q.matchesPredicates(preds, captures, nil, source) {
+		t.Fatal("any-not-eq? should match when some node does not equal 'xyz'")
+	}
+}
+
+func TestAnyMatchMatchesPredicates(t *testing.T) {
+	source := []byte("foo bar baz")
+	n1 := leaf(Symbol(1), true, 0, 3)  // "foo"
+	n2 := leaf(Symbol(1), true, 4, 7)  // "bar"
+	n3 := leaf(Symbol(1), true, 8, 11) // "baz"
+
+	captures := []QueryCapture{
+		{Name: "items", Node: n1},
+		{Name: "items", Node: n2},
+		{Name: "items", Node: n3},
+	}
+
+	q := &Query{}
+	rx := mustCompileTestRegex(t, "^ba")
+
+	// Should match: "bar" and "baz" both match ^ba.
+	preds := []QueryPredicate{{
+		kind:        predicateAnyMatch,
+		leftCapture: "items",
+		regex:       rx,
+	}}
+	if !q.matchesPredicates(preds, captures, nil, source) {
+		t.Fatal("any-match? should match when at least one node matches ^ba")
+	}
+
+	// Should not match: nothing matches ^xyz.
+	rx2 := mustCompileTestRegex(t, "^xyz")
+	preds[0].regex = rx2
+	if q.matchesPredicates(preds, captures, nil, source) {
+		t.Fatal("any-match? should not match when no node matches ^xyz")
+	}
+}
+
+func TestAnyNotMatchMatchesPredicates(t *testing.T) {
+	source := []byte("bar baz")
+	n1 := leaf(Symbol(1), true, 0, 3) // "bar"
+	n2 := leaf(Symbol(1), true, 4, 7) // "baz"
+
+	captures := []QueryCapture{
+		{Name: "items", Node: n1},
+		{Name: "items", Node: n2},
+	}
+
+	q := &Query{}
+
+	// ^ba matches both "bar" and "baz", so any-not-match? ^ba should NOT match.
+	rx := mustCompileTestRegex(t, "^ba")
+	preds := []QueryPredicate{{
+		kind:        predicateAnyNotMatch,
+		leftCapture: "items",
+		regex:       rx,
+	}}
+	if q.matchesPredicates(preds, captures, nil, source) {
+		t.Fatal("any-not-match? should not match when all nodes match ^ba")
+	}
+
+	// ^bar matches "bar" but not "baz", so any-not-match? ^bar should match.
+	rx2 := mustCompileTestRegex(t, "^bar$")
+	preds[0].regex = rx2
+	if !q.matchesPredicates(preds, captures, nil, source) {
+		t.Fatal("any-not-match? should match when at least one node does not match ^bar$")
+	}
+}
+
+func TestAnyEqEmptyCaptures(t *testing.T) {
+	source := []byte("foo")
+	q := &Query{}
+
+	preds := []QueryPredicate{{
+		kind:        predicateAnyEq,
+		leftCapture: "missing",
+		literal:     "foo",
+	}}
+	if q.matchesPredicates(preds, nil, nil, source) {
+		t.Fatal("any-eq? should return false for empty captures")
+	}
+}
+
+func TestAnyMatchNilRegex(t *testing.T) {
+	source := []byte("foo")
+	n := leaf(Symbol(1), true, 0, 3)
+	captures := []QueryCapture{{Name: "x", Node: n}}
+	q := &Query{}
+
+	preds := []QueryPredicate{{
+		kind:        predicateAnyMatch,
+		leftCapture: "x",
+		regex:       nil,
+	}}
+	if q.matchesPredicates(preds, captures, nil, source) {
+		t.Fatal("any-match? with nil regex should return false")
+	}
+}
+
+func mustCompileTestRegex(t *testing.T, pattern string) *regexp.Regexp {
+	t.Helper()
+	rx, err := regexp.Compile(pattern)
+	if err != nil {
+		t.Fatalf("bad test regex %q: %v", pattern, err)
+	}
+	return rx
+}
+
+// --------------------------------------------------------------------------
+// #select-adjacent! directive tests
+// --------------------------------------------------------------------------
+
+func TestSelectAdjacentParse(t *testing.T) {
+	lang := queryTestLanguage()
+	q, err := NewQuery(`(identifier) @items (#select-adjacent! @items @anchor)`, lang)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if len(q.patterns) != 1 {
+		t.Fatalf("expected 1 pattern, got %d", len(q.patterns))
+	}
+	preds := q.patterns[0].predicates
+	if len(preds) != 1 {
+		t.Fatalf("expected 1 predicate, got %d", len(preds))
+	}
+	if preds[0].kind != predicateSelectAdjacent {
+		t.Errorf("kind: got %d, want predicateSelectAdjacent", preds[0].kind)
+	}
+	if preds[0].leftCapture != "items" {
+		t.Errorf("leftCapture: got %q, want %q", preds[0].leftCapture, "items")
+	}
+	if preds[0].rightCapture != "anchor" {
+		t.Errorf("rightCapture: got %q, want %q", preds[0].rightCapture, "anchor")
+	}
+}
+
+func TestSelectAdjacentParseErrors(t *testing.T) {
+	lang := queryTestLanguage()
+	// First argument must be a capture
+	_, err := NewQuery(`(identifier) @x (#select-adjacent! "foo" @y)`, lang)
+	if err == nil {
+		t.Fatal("expected error for non-capture first argument")
+	}
+	// Second argument must be a capture
+	_, err = NewQuery(`(identifier) @x (#select-adjacent! @x "bar")`, lang)
+	if err == nil {
+		t.Fatal("expected error for non-capture second argument")
+	}
+}
+
+func TestSelectAdjacentFiltering(t *testing.T) {
+	// Source: "abcdef"
+	//   node A: bytes [0,3)  "abc"
+	//   node B: bytes [3,6)  "def"  -- adjacent to A (A.end == B.start)
+	//   node C: bytes [7,10) "ghi"  -- NOT adjacent to A
+	source := []byte("abcdef ghi")
+	nodeA := leaf(Symbol(1), true, 0, 3)  // "abc"
+	nodeB := leaf(Symbol(1), true, 3, 6)  // "def"
+	nodeC := leaf(Symbol(1), true, 7, 10) // "ghi"
+
+	captures := []QueryCapture{
+		{Name: "items", Node: nodeA},
+		{Name: "items", Node: nodeB},
+		{Name: "items", Node: nodeC},
+		{Name: "anchor", Node: nodeA},
+	}
+
+	pred := QueryPredicate{
+		kind:         predicateSelectAdjacent,
+		leftCapture:  "items",
+		rightCapture: "anchor",
+	}
+
+	result := applySelectAdjacent(pred, captures)
+
+	// Should keep nodeB (adjacent: A.end==3 == B.start==3)
+	// Should NOT keep nodeA (A.end==3 != A.start==0 from anchor, A.start==0 != A.end==3 from anchor ... wait)
+	// Actually nodeA IS the anchor, so: nodeA.end==3 == anchor.start==0? No. nodeA.start==0 == anchor.end==3? No.
+	// So nodeA should NOT be adjacent (it is the anchor itself, but the adjacency check only looks at
+	// whether end==start or start==end between items and anchors).
+	// nodeB: B.start==3 == anchor.end==3 → YES
+	// nodeC: C.start==7 != 3, C.end==10 != 0 → NO
+
+	var itemNames []string
+	for _, c := range result {
+		if c.Name == "items" {
+			itemNames = append(itemNames, c.Node.Text(source))
+		}
+	}
+
+	if len(itemNames) != 1 || itemNames[0] != "def" {
+		t.Fatalf("expected items=[def], got %v", itemNames)
+	}
+
+	// Anchor should still be present in the result.
+	hasAnchor := false
+	for _, c := range result {
+		if c.Name == "anchor" {
+			hasAnchor = true
+		}
+	}
+	if !hasAnchor {
+		t.Fatal("anchor capture should still be in the result")
+	}
+}
+
+func TestSelectAdjacentBothDirections(t *testing.T) {
+	// Test adjacency in both directions:
+	// anchor at [5,8), item at [3,5) → item.end==5 == anchor.start==5 → adjacent
+	// anchor at [5,8), item at [8,11) → item.start==8 == anchor.end==8 → adjacent
+	itemBefore := leaf(Symbol(1), true, 3, 5)  // "ab"
+	anchor := leaf(Symbol(1), true, 5, 8)       // "anc" (conceptually)
+	itemAfter := leaf(Symbol(1), true, 8, 11)   // "hor" (conceptually)
+	itemFar := leaf(Symbol(1), true, 12, 14)    // far away
+
+	captures := []QueryCapture{
+		{Name: "items", Node: itemBefore},
+		{Name: "items", Node: itemAfter},
+		{Name: "items", Node: itemFar},
+		{Name: "anchor", Node: anchor},
+	}
+
+	pred := QueryPredicate{
+		kind:         predicateSelectAdjacent,
+		leftCapture:  "items",
+		rightCapture: "anchor",
+	}
+
+	result := applySelectAdjacent(pred, captures)
+
+	var kept []*Node
+	for _, c := range result {
+		if c.Name == "items" {
+			kept = append(kept, c.Node)
+		}
+	}
+
+	if len(kept) != 2 {
+		t.Fatalf("expected 2 adjacent items, got %d", len(kept))
+	}
+	if kept[0] != itemBefore {
+		t.Errorf("first kept item should be itemBefore")
+	}
+	if kept[1] != itemAfter {
+		t.Errorf("second kept item should be itemAfter")
+	}
+}
+
+func TestSelectAdjacentNoAnchors(t *testing.T) {
+	// When there are no anchor captures, all items should be removed.
+	source := []byte("abc")
+	n := leaf(Symbol(1), true, 0, 3)
+	_ = source
+
+	captures := []QueryCapture{
+		{Name: "items", Node: n},
+	}
+
+	pred := QueryPredicate{
+		kind:         predicateSelectAdjacent,
+		leftCapture:  "items",
+		rightCapture: "anchor",
+	}
+
+	result := applySelectAdjacent(pred, captures)
+	for _, c := range result {
+		if c.Name == "items" {
+			t.Fatal("no items should remain when there are no anchors")
+		}
+	}
+}
+
+func TestSelectAdjacentMultipleAnchors(t *testing.T) {
+	// Multiple anchors: item is adjacent if adjacent to ANY anchor.
+	// anchor1 at [0,3), anchor2 at [6,9)
+	// item at [3,6) → adjacent to anchor1 (item.start==3==anchor1.end) AND anchor2 (item.end==6==anchor2.start)
+	// item at [10,13) → not adjacent to either
+	n1 := leaf(Symbol(1), true, 3, 6)
+	n2 := leaf(Symbol(1), true, 10, 13)
+	anchor1 := leaf(Symbol(1), true, 0, 3)
+	anchor2 := leaf(Symbol(1), true, 6, 9)
+
+	captures := []QueryCapture{
+		{Name: "items", Node: n1},
+		{Name: "items", Node: n2},
+		{Name: "anchor", Node: anchor1},
+		{Name: "anchor", Node: anchor2},
+	}
+
+	pred := QueryPredicate{
+		kind:         predicateSelectAdjacent,
+		leftCapture:  "items",
+		rightCapture: "anchor",
+	}
+
+	result := applySelectAdjacent(pred, captures)
+
+	var kept []*Node
+	for _, c := range result {
+		if c.Name == "items" {
+			kept = append(kept, c.Node)
+		}
+	}
+	if len(kept) != 1 {
+		t.Fatalf("expected 1 adjacent item, got %d", len(kept))
+	}
+	if kept[0] != n1 {
+		t.Error("expected n1 to be kept (adjacent to both anchors)")
+	}
+}
+
+// --------------------------------------------------------------------------
+// #strip! directive tests
+// --------------------------------------------------------------------------
+
+func TestStripParse(t *testing.T) {
+	lang := queryTestLanguage()
+	q, err := NewQuery(`(identifier) @name (#strip! @name "^_+")`, lang)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if len(q.patterns) != 1 {
+		t.Fatalf("expected 1 pattern, got %d", len(q.patterns))
+	}
+	preds := q.patterns[0].predicates
+	if len(preds) != 1 {
+		t.Fatalf("expected 1 predicate, got %d", len(preds))
+	}
+	if preds[0].kind != predicateStrip {
+		t.Errorf("kind: got %d, want predicateStrip", preds[0].kind)
+	}
+	if preds[0].leftCapture != "name" {
+		t.Errorf("leftCapture: got %q, want %q", preds[0].leftCapture, "name")
+	}
+	if preds[0].literal != "^_+" {
+		t.Errorf("literal: got %q, want %q", preds[0].literal, "^_+")
+	}
+	if preds[0].regex == nil {
+		t.Fatal("regex should be compiled")
+	}
+}
+
+func TestStripParseErrors(t *testing.T) {
+	lang := queryTestLanguage()
+	// First argument must be a capture
+	_, err := NewQuery(`(identifier) @x (#strip! "foo" "bar")`, lang)
+	if err == nil {
+		t.Fatal("expected error for non-capture first argument")
+	}
+	// Second argument must be a string, not a capture
+	_, err = NewQuery(`(identifier) @x (#strip! @x @y)`, lang)
+	if err == nil {
+		t.Fatal("expected error for capture second argument")
+	}
+	// Invalid regex
+	_, err = NewQuery(`(identifier) @x (#strip! @x "[invalid")`, lang)
+	if err == nil {
+		t.Fatal("expected error for invalid regex")
+	}
+}
+
+func TestStripApply(t *testing.T) {
+	source := []byte("__hello__world")
+	n := leaf(Symbol(1), true, 0, 14)
+
+	captures := []QueryCapture{
+		{Name: "name", Node: n},
+	}
+
+	rx := mustCompileTestRegex(t, "_+")
+	pred := QueryPredicate{
+		kind:        predicateStrip,
+		leftCapture: "name",
+		regex:       rx,
+	}
+
+	result := applyStrip(pred, captures, source)
+
+	if len(result) != 1 {
+		t.Fatalf("expected 1 capture, got %d", len(result))
+	}
+	if result[0].TextOverride != "helloworld" {
+		t.Errorf("TextOverride: got %q, want %q", result[0].TextOverride, "helloworld")
+	}
+}
+
+func TestStripNoChange(t *testing.T) {
+	// When the regex doesn't match, TextOverride should remain empty.
+	source := []byte("hello")
+	n := leaf(Symbol(1), true, 0, 5)
+
+	captures := []QueryCapture{
+		{Name: "name", Node: n},
+	}
+
+	rx := mustCompileTestRegex(t, "_+")
+	pred := QueryPredicate{
+		kind:        predicateStrip,
+		leftCapture: "name",
+		regex:       rx,
+	}
+
+	result := applyStrip(pred, captures, source)
+
+	if result[0].TextOverride != "" {
+		t.Errorf("TextOverride should be empty when regex doesn't match, got %q", result[0].TextOverride)
+	}
+}
+
+func TestStripOnlyAffectsNamedCapture(t *testing.T) {
+	source := []byte("__foo__bar")
+	n1 := leaf(Symbol(1), true, 0, 5)  // "__foo"
+	n2 := leaf(Symbol(1), true, 5, 10) // "__bar"
+
+	captures := []QueryCapture{
+		{Name: "target", Node: n1},
+		{Name: "other", Node: n2},
+	}
+
+	rx := mustCompileTestRegex(t, "^_+")
+	pred := QueryPredicate{
+		kind:        predicateStrip,
+		leftCapture: "target",
+		regex:       rx,
+	}
+
+	result := applyStrip(pred, captures, source)
+
+	if result[0].TextOverride != "foo" {
+		t.Errorf("target TextOverride: got %q, want %q", result[0].TextOverride, "foo")
+	}
+	if result[1].TextOverride != "" {
+		t.Errorf("other TextOverride should be empty, got %q", result[1].TextOverride)
+	}
+}
+
+func TestStripNilRegex(t *testing.T) {
+	source := []byte("hello")
+	n := leaf(Symbol(1), true, 0, 5)
+
+	captures := []QueryCapture{
+		{Name: "name", Node: n},
+	}
+
+	pred := QueryPredicate{
+		kind:        predicateStrip,
+		leftCapture: "name",
+		regex:       nil,
+	}
+
+	result := applyStrip(pred, captures, source)
+	if result[0].TextOverride != "" {
+		t.Errorf("nil regex should not set TextOverride, got %q", result[0].TextOverride)
+	}
+}
+
+func TestQueryCaptureText(t *testing.T) {
+	source := []byte("hello world")
+	n := leaf(Symbol(1), true, 0, 5) // "hello"
+
+	// Without TextOverride, Text() returns node text.
+	c := QueryCapture{Name: "x", Node: n}
+	if got := c.Text(source); got != "hello" {
+		t.Errorf("Text() without override: got %q, want %q", got, "hello")
+	}
+
+	// With TextOverride, Text() returns the override.
+	c.TextOverride = "stripped"
+	if got := c.Text(source); got != "stripped" {
+		t.Errorf("Text() with override: got %q, want %q", got, "stripped")
+	}
+
+	// Nil node with no override returns empty.
+	c2 := QueryCapture{Name: "y", Node: nil}
+	if got := c2.Text(source); got != "" {
+		t.Errorf("Text() nil node: got %q, want %q", got, "")
+	}
+}
+
+func TestStripDoesNotFilterMatch(t *testing.T) {
+	// #strip! is a directive — it should not cause the match to be rejected.
+	// Verify that matchesPredicates returns true when #strip! is present.
+	q := &Query{}
+	source := []byte("__hello")
+	n := leaf(Symbol(1), true, 0, 7)
+
+	captures := []QueryCapture{
+		{Name: "name", Node: n},
+	}
+
+	rx := mustCompileTestRegex(t, "^_+")
+	preds := []QueryPredicate{{
+		kind:        predicateStrip,
+		leftCapture: "name",
+		regex:       rx,
+	}}
+
+	if !q.matchesPredicates(preds, captures, nil, source) {
+		t.Fatal("#strip! should not cause match rejection")
+	}
+}
+
+func TestSelectAdjacentDoesNotFilterMatch(t *testing.T) {
+	// #select-adjacent! is a directive — it should not cause the match to be rejected.
+	q := &Query{}
+	source := []byte("abc")
+	n := leaf(Symbol(1), true, 0, 3)
+
+	captures := []QueryCapture{
+		{Name: "items", Node: n},
+	}
+
+	preds := []QueryPredicate{{
+		kind:         predicateSelectAdjacent,
+		leftCapture:  "items",
+		rightCapture: "anchor",
+	}}
+
+	if !q.matchesPredicates(preds, captures, nil, source) {
+		t.Fatal("#select-adjacent! should not cause match rejection")
+	}
 }

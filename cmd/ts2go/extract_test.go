@@ -786,3 +786,304 @@ func TestResolveSymbol(t *testing.T) {
 		t.Error("resolveSymbol(totally_unknown) should return false")
 	}
 }
+
+func TestExtractLexModesReservedWordSetID(t *testing.T) {
+	src := `
+#define LANGUAGE_VERSION 15
+#define STATE_COUNT 3
+#define LARGE_STATE_COUNT 1
+#define SYMBOL_COUNT 3
+#define ALIAS_COUNT 0
+#define TOKEN_COUNT 2
+#define EXTERNAL_TOKEN_COUNT 0
+#define FIELD_COUNT 0
+#define MAX_ALIAS_SEQUENCE_LENGTH 1
+#define PRODUCTION_ID_COUNT 1
+
+enum ts_symbol_identifiers {
+  sym_id = 1,
+  sym_doc = 2,
+};
+
+static const char * const ts_symbol_names[] = {
+  [0] = "end",
+  [1] = "id",
+  [2] = "doc",
+};
+
+static const TSSymbolMetadata ts_symbol_metadata[] = {
+  [0] = { .visible = false, .named = true },
+  [1] = { .visible = true, .named = true },
+  [2] = { .visible = true, .named = true },
+};
+
+static const TSParseActionEntry ts_parse_actions[] = {
+  [0] = {.entry = {.count = 0, .reusable = false}},
+};
+
+static const uint16_t ts_parse_table[LARGE_STATE_COUNT][SYMBOL_COUNT] = {
+  [0] = {
+    [1] = 0,
+  },
+};
+
+static const TSLexMode ts_lex_modes[STATE_COUNT] = {
+  [0] = {.lex_state = 0, .reserved_word_set_id = 1},
+  [1] = {.lex_state = 1, .external_lex_state = 2, .reserved_word_set_id = 3},
+  [2] = {.lex_state = 5},
+};
+
+static bool ts_lex(TSLexer *lexer, TSStateId state) {
+  START_LEXER();
+  eof = lexer->eof(lexer);
+  switch (state) {
+    case 0:
+      ACCEPT_TOKEN(ts_builtin_sym_end);
+      END_STATE();
+  }
+}
+
+const TSLanguage *tree_sitter_rwtest(void) {
+  static const TSLanguage language = { .version = LANGUAGE_VERSION };
+  return &language;
+}
+`
+	g, err := ExtractGrammar(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(g.LexModes) != 3 {
+		t.Fatalf("len(LexModes) = %d, want 3", len(g.LexModes))
+	}
+	if g.LexModes[0].ReservedWordSetID != 1 {
+		t.Errorf("LexModes[0].ReservedWordSetID = %d, want 1", g.LexModes[0].ReservedWordSetID)
+	}
+	if g.LexModes[1].ReservedWordSetID != 3 {
+		t.Errorf("LexModes[1].ReservedWordSetID = %d, want 3", g.LexModes[1].ReservedWordSetID)
+	}
+	if g.LexModes[1].ExternalLexState != 2 {
+		t.Errorf("LexModes[1].ExternalLexState = %d, want 2", g.LexModes[1].ExternalLexState)
+	}
+	if g.LexModes[2].ReservedWordSetID != 0 {
+		t.Errorf("LexModes[2].ReservedWordSetID = %d, want 0", g.LexModes[2].ReservedWordSetID)
+	}
+}
+
+func TestExtractReservedWords(t *testing.T) {
+	src := `
+enum ts_symbol_identifiers {
+  sym_if = 1,
+  sym_else = 2,
+  sym_while = 3,
+  sym_class = 4,
+};
+
+static const TSSymbol ts_reserved_words[3][5] = {
+  [1] = {sym_if, sym_else, sym_while, 0, 0},
+  [2] = {sym_class, 0, 0, 0, 0},
+};
+`
+	g := &ExtractedGrammar{enumValues: extractEnum(src)}
+	if err := extractReservedWords(src, g); err != nil {
+		t.Fatal(err)
+	}
+
+	if g.MaxReservedWordSetSize != 5 {
+		t.Errorf("MaxReservedWordSetSize = %d, want 5", g.MaxReservedWordSetSize)
+	}
+	if len(g.ReservedWords) != 15 {
+		t.Fatalf("len(ReservedWords) = %d, want 15 (3*5)", len(g.ReservedWords))
+	}
+
+	// Set 0 should be all zeros (not initialized).
+	for i := 0; i < 5; i++ {
+		if g.ReservedWords[i] != 0 {
+			t.Errorf("ReservedWords[%d] = %d, want 0", i, g.ReservedWords[i])
+		}
+	}
+	// Set 1: {sym_if=1, sym_else=2, sym_while=3, 0, 0}
+	if g.ReservedWords[5] != 1 {
+		t.Errorf("ReservedWords[5] = %d, want 1 (sym_if)", g.ReservedWords[5])
+	}
+	if g.ReservedWords[6] != 2 {
+		t.Errorf("ReservedWords[6] = %d, want 2 (sym_else)", g.ReservedWords[6])
+	}
+	if g.ReservedWords[7] != 3 {
+		t.Errorf("ReservedWords[7] = %d, want 3 (sym_while)", g.ReservedWords[7])
+	}
+	// Set 2: {sym_class=4, 0, 0, 0, 0}
+	if g.ReservedWords[10] != 4 {
+		t.Errorf("ReservedWords[10] = %d, want 4 (sym_class)", g.ReservedWords[10])
+	}
+}
+
+func TestExtractReservedWordsAbsent(t *testing.T) {
+	// ABI 14 grammar without reserved words — should not error.
+	g := &ExtractedGrammar{enumValues: map[string]int{}}
+	if err := extractReservedWords(miniParserC, g); err != nil {
+		t.Fatal(err)
+	}
+	if g.ReservedWords != nil {
+		t.Error("ReservedWords should be nil for ABI < 15")
+	}
+}
+
+func TestExtractSupertypes(t *testing.T) {
+	src := `
+#define SUPERTYPE_COUNT 2
+
+enum ts_symbol_identifiers {
+  sym__expression = 10,
+  sym__statement = 20,
+  sym_binary = 11,
+  sym_call = 12,
+  sym_assign = 21,
+};
+
+static const TSSymbol ts_supertype_symbols[SUPERTYPE_COUNT] = {
+  [0] = sym__expression,
+  [1] = sym__statement,
+};
+
+static const TSMapSlice ts_supertype_map_slices[] = {
+  [sym__expression] = {.index = 0, .length = 2},
+  [sym__statement] = {.index = 2, .length = 1},
+};
+
+static const TSSymbol ts_supertype_map_entries[] = {
+  sym_binary,
+  sym_call,
+  sym_assign,
+};
+`
+	g := &ExtractedGrammar{
+		SupertypeCount: 2,
+		enumValues:     extractEnum(src),
+	}
+	if err := extractSupertypes(src, g); err != nil {
+		t.Fatal(err)
+	}
+
+	// Supertype symbols.
+	if len(g.SupertypeSymbols) != 2 {
+		t.Fatalf("len(SupertypeSymbols) = %d, want 2", len(g.SupertypeSymbols))
+	}
+	if g.SupertypeSymbols[0] != 10 {
+		t.Errorf("SupertypeSymbols[0] = %d, want 10 (sym__expression)", g.SupertypeSymbols[0])
+	}
+	if g.SupertypeSymbols[1] != 20 {
+		t.Errorf("SupertypeSymbols[1] = %d, want 20 (sym__statement)", g.SupertypeSymbols[1])
+	}
+
+	// Supertype map slices — indexed by symbol ID.
+	if len(g.SupertypeMapSlices) < 21 {
+		t.Fatalf("len(SupertypeMapSlices) = %d, want at least 21", len(g.SupertypeMapSlices))
+	}
+	if g.SupertypeMapSlices[10] != [2]uint16{0, 2} {
+		t.Errorf("SupertypeMapSlices[10] = %v, want [0 2]", g.SupertypeMapSlices[10])
+	}
+	if g.SupertypeMapSlices[20] != [2]uint16{2, 1} {
+		t.Errorf("SupertypeMapSlices[20] = %v, want [2 1]", g.SupertypeMapSlices[20])
+	}
+
+	// Supertype map entries.
+	if len(g.SupertypeMapEntries) != 3 {
+		t.Fatalf("len(SupertypeMapEntries) = %d, want 3", len(g.SupertypeMapEntries))
+	}
+	if g.SupertypeMapEntries[0] != 11 {
+		t.Errorf("SupertypeMapEntries[0] = %d, want 11 (sym_binary)", g.SupertypeMapEntries[0])
+	}
+	if g.SupertypeMapEntries[1] != 12 {
+		t.Errorf("SupertypeMapEntries[1] = %d, want 12 (sym_call)", g.SupertypeMapEntries[1])
+	}
+	if g.SupertypeMapEntries[2] != 21 {
+		t.Errorf("SupertypeMapEntries[2] = %d, want 21 (sym_assign)", g.SupertypeMapEntries[2])
+	}
+}
+
+func TestExtractSupertypesAbsent(t *testing.T) {
+	// Grammar without SUPERTYPE_COUNT — should not error.
+	g := &ExtractedGrammar{
+		SupertypeCount: 0,
+		enumValues:     map[string]int{},
+	}
+	if err := extractSupertypes("", g); err != nil {
+		t.Fatal(err)
+	}
+	if g.SupertypeSymbols != nil {
+		t.Error("SupertypeSymbols should be nil when SupertypeCount=0")
+	}
+}
+
+func TestExtractLanguageMetadata(t *testing.T) {
+	src := `
+const TSLanguage *tree_sitter_example(void) {
+  static const TSLanguage language = {
+    .version = 15,
+    .metadata = {
+      .major_version = 1,
+      .minor_version = 23,
+      .patch_version = 5,
+    },
+  };
+  return &language;
+}
+`
+	g := &ExtractedGrammar{}
+	if err := extractLanguageMetadata(src, g); err != nil {
+		t.Fatal(err)
+	}
+	if g.LanguageMetadataMajor != 1 {
+		t.Errorf("LanguageMetadataMajor = %d, want 1", g.LanguageMetadataMajor)
+	}
+	if g.LanguageMetadataMinor != 23 {
+		t.Errorf("LanguageMetadataMinor = %d, want 23", g.LanguageMetadataMinor)
+	}
+	if g.LanguageMetadataPatch != 5 {
+		t.Errorf("LanguageMetadataPatch = %d, want 5", g.LanguageMetadataPatch)
+	}
+}
+
+func TestExtractLanguageMetadataAbsent(t *testing.T) {
+	// ABI 14 grammar without .metadata — should not error.
+	g := &ExtractedGrammar{}
+	if err := extractLanguageMetadata(miniParserC, g); err != nil {
+		t.Fatal(err)
+	}
+	if g.LanguageMetadataMajor != 0 || g.LanguageMetadataMinor != 0 || g.LanguageMetadataPatch != 0 {
+		t.Error("metadata should be zeroed for ABI < 15")
+	}
+}
+
+func TestExtractSupertypeCount(t *testing.T) {
+	src := `
+#define STATE_COUNT 1
+#define SYMBOL_COUNT 1
+#define SUPERTYPE_COUNT 7
+`
+	g := &ExtractedGrammar{}
+	if err := extractConstants(src, g); err != nil {
+		t.Fatal(err)
+	}
+	if g.SupertypeCount != 7 {
+		t.Errorf("SupertypeCount = %d, want 7", g.SupertypeCount)
+	}
+}
+
+func TestExtractGrammarABI14NoCrash(t *testing.T) {
+	// Ensure ABI 14 miniParserC still works with the new extraction pipeline.
+	g, err := ExtractGrammar(miniParserC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.ReservedWords != nil {
+		t.Error("ReservedWords should be nil for ABI 14")
+	}
+	if g.SupertypeSymbols != nil {
+		t.Error("SupertypeSymbols should be nil for ABI 14")
+	}
+	if g.LanguageMetadataMajor != 0 {
+		t.Error("LanguageMetadataMajor should be 0 for ABI 14")
+	}
+}

@@ -23,6 +23,7 @@ var highlightNoRangesExpected = map[string]bool{
 
 func TestAllHighlightQueriesCompile(t *testing.T) {
 	entries := AllLanguages()
+	t.Cleanup(func() { PurgeEmbeddedLanguageCache() })
 
 	var withQuery int
 	var compileErrs int
@@ -32,10 +33,12 @@ func TestAllHighlightQueriesCompile(t *testing.T) {
 			continue
 		}
 		withQuery++
-		if _, err := gotreesitter.NewQuery(entry.HighlightQuery, entry.Language()); err != nil {
+		lang := entry.Language()
+		if _, err := gotreesitter.NewQuery(entry.HighlightQuery, lang); err != nil {
 			compileErrs++
 			t.Errorf("%s: highlight query compile error: %v", entry.Name, err)
 		}
+		UnloadEmbeddedLanguage(entry.Name + ".bin")
 	}
 
 	t.Logf("highlight compile audit: with_query=%d compile_errors=%d", withQuery, compileErrs)
@@ -43,6 +46,7 @@ func TestAllHighlightQueriesCompile(t *testing.T) {
 
 func TestAllTagsQueriesCompile(t *testing.T) {
 	entries := AllLanguages()
+	t.Cleanup(func() { PurgeEmbeddedLanguageCache() })
 
 	var withQuery int
 	var compileErrs int
@@ -52,10 +56,12 @@ func TestAllTagsQueriesCompile(t *testing.T) {
 			continue
 		}
 		withQuery++
-		if _, err := gotreesitter.NewTagger(entry.Language(), entry.TagsQuery); err != nil {
+		lang := entry.Language()
+		if _, err := gotreesitter.NewTagger(lang, entry.TagsQuery); err != nil {
 			compileErrs++
 			t.Errorf("%s: tags query compile error: %v", entry.Name, err)
 		}
+		UnloadEmbeddedLanguage(entry.Name + ".bin")
 	}
 
 	t.Logf("tags compile audit: with_query=%d compile_errors=%d", withQuery, compileErrs)
@@ -63,12 +69,7 @@ func TestAllTagsQueriesCompile(t *testing.T) {
 
 func TestHighlightQueriesProduceResults(t *testing.T) {
 	entries := AllLanguages()
-
-	reports := AuditParseSupport()
-	reportByName := make(map[string]ParseSupport, len(reports))
-	for _, r := range reports {
-		reportByName[r.Name] = r
-	}
+	t.Cleanup(func() { PurgeEmbeddedLanguageCache() })
 
 	var tested, skippedNoQuery, skippedNoSample, skippedUnsupported int
 	for _, entry := range entries {
@@ -78,22 +79,23 @@ func TestHighlightQueriesProduceResults(t *testing.T) {
 			continue
 		}
 
-		report := reportByName[name]
+		lang := entry.Language()
+		report := EvaluateParseSupport(entry, lang)
 		if report.Backend == ParseBackendUnsupported {
 			skippedUnsupported++
+			UnloadEmbeddedLanguage(entry.Name + ".bin")
 			continue
 		}
 
-		sample := parseSmokeSample(name)
+		sample := ParseSmokeSample(name)
 		if sample == "x\n" {
 			skippedNoSample++
+			UnloadEmbeddedLanguage(entry.Name + ".bin")
 			continue
 		}
 
 		tested++
 		t.Run(name, func(t *testing.T) {
-			lang := entry.Language()
-
 			// Build highlighter options.
 			var opts []gotreesitter.HighlighterOption
 			if entry.TokenSourceFactory != nil {
@@ -115,6 +117,7 @@ func TestHighlightQueriesProduceResults(t *testing.T) {
 				t.Errorf("highlight query compiled but produced 0 ranges for sample %q", sample)
 			}
 		})
+		UnloadEmbeddedLanguage(entry.Name + ".bin")
 	}
 
 	t.Logf("highlight validation: tested=%d skipped(no_query=%d no_sample=%d unsupported=%d)",

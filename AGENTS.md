@@ -61,3 +61,17 @@ Use profiled runs to decide whether the next win comes from:
 - Use project commit flow:
   - `git add ...`
   - `buckley commit --yes --minimal-output`
+
+### 7) Gate Presets
+Correctness preset:
+- `go test ./...`
+- `go test ./grammars -run '^TestTop50ParseSmokeNoErrors$' -count=1 -v`
+- `cd cgo_harness && go test . -tags treesitter_c_parity -run '^TestParityFreshParse$|^TestParityHasNoErrors$|^TestParityIssue3Repros$|^TestParityGLRCanaryGo$' -count=1 -v`
+- `cd cgo_harness && go test . -tags treesitter_c_parity -run '^TestParityCorpusFreshParse$' -count=1 -v`
+
+Perf preset (stable settings):
+- `GOMAXPROCS=1 go test . -run '^$' -bench 'BenchmarkGoParseFullDFA|BenchmarkGoParseIncrementalSingleByteEditDFA|BenchmarkGoParseIncrementalNoEditDFA' -benchmem -count=10 -benchtime=750ms`
+
+Full-parse non-truncation probe:
+- `GOT_PARSE_NODE_LIMIT_SCALE=3` may be used for diagnostic full-parse runs when default node budget truncates benchmark/parity cases.
+- `GOT_GLR_MAX_STACKS=...` overrides the default GLR stack cap (default 6).

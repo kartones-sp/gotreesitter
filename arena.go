@@ -18,9 +18,9 @@ const (
 	// Default capacities for slice backing storage used by reduce actions.
 	// Full parses allocate many more parent-child edges than incremental edits.
 	incrementalChildSliceCap = 2 * 1024
-	fullChildSliceCap        = 32 * 1024
+	fullChildSliceCap        = 64 * 1024
 	incrementalFieldSliceCap = 2 * 1024
-	fullFieldSliceCap        = 32 * 1024
+	fullFieldSliceCap        = 64 * 1024
 
 	maxRetainedArenaFactor = 4
 	// Full-parse node slabs are much larger; keep more headroom so capacity
@@ -31,7 +31,6 @@ const (
 	// on warm edit/full-parse workloads.
 	maxRetainedIncrementalNodeCap = 1 * 1024 * 1024
 	maxRetainedFullNodeCap        = 2 * 1024 * 1024
-
 )
 
 type arenaClass uint8
@@ -49,6 +48,9 @@ type nodeArena struct {
 	nodes []Node
 	used  int
 	refs  atomic.Int32
+	// skipChildClear allows reset() to skip child-slab pointer clearing when
+	// a parse did not borrow any external nodes (full parse without reuse).
+	skipChildClear bool
 
 	nodeSlabs      []nodeSlab
 	nodeSlabCursor int
@@ -76,25 +78,24 @@ type fieldSliceSlab struct {
 
 var (
 	incrementalArenaPool = nodeArenaPool{
-		class:     arenaClassIncremental,
-		slabBytes: incrementalArenaSlab,
-		maxSize:   8,
+		class:   arenaClassIncremental,
+		maxSize: 8,
 	}
 	fullArenaPool = nodeArenaPool{
-		class:     arenaClassFull,
-		slabBytes: fullParseArenaSlab,
-		maxSize:   4,
+		class:   arenaClassFull,
+		maxSize: 4,
 	}
 )
 
 type nodeArenaPool struct {
-	mu        sync.Mutex
-	class     arenaClass
-	slabBytes int
-	maxSize   int
+	mu      sync.Mutex
+	class   arenaClass
+	maxSize int
 	free      []*nodeArena
 }
 
+// ArenaProfile captures node arena allocation statistics.
+// Enable with SetArenaProfileEnabled(true) and retrieve with GetArenaProfile().
 type ArenaProfile struct {
 	IncrementalAcquire uint64
 	IncrementalNew     uint64
@@ -133,7 +134,7 @@ func (p *nodeArenaPool) acquire() *nodeArena {
 	n := len(p.free)
 	if n == 0 {
 		p.mu.Unlock()
-		a := newNodeArena(p.class, p.slabBytes)
+		a := newNodeArena(p.class)
 		if arenaProfileEnabled {
 			switch p.class {
 			case arenaClassIncremental:
@@ -183,7 +184,7 @@ func nodeCapacityForBytes(slabBytes int) int {
 	return capacity
 }
 
-func newNodeArena(class arenaClass, slabBytes int) *nodeArena {
+func newNodeArena(class arenaClass) *nodeArena {
 	childCap := fullChildSliceCap
 	fieldCap := fullFieldSliceCap
 	if class == arenaClassIncremental {
@@ -234,10 +235,7 @@ func (a *nodeArena) Release() {
 }
 
 func (a *nodeArena) reset() {
-	primaryUsed := a.used
-	if primaryUsed > len(a.nodes) {
-		primaryUsed = len(a.nodes)
-	}
+	primaryUsed := min(a.used, len(a.nodes))
 	clear(a.nodes[:primaryUsed])
 	a.used = 0
 	for i := range a.nodeSlabs {
@@ -269,9 +267,12 @@ func (a *nodeArena) reset() {
 
 	for i := range a.childSlabs {
 		slab := &a.childSlabs[i]
-		clear(slab.data[:slab.used])
+		if !a.skipChildClear {
+			clear(slab.data[:slab.used])
+		}
 		slab.used = 0
 	}
+	a.skipChildClear = false
 	for i := range a.fieldSlabs {
 		a.fieldSlabs[i].used = 0
 	}
@@ -307,10 +308,7 @@ func (a *nodeArena) allocNodeFast() *Node {
 
 func (a *nodeArena) allocNodeSlow() *Node {
 	if len(a.nodeSlabs) == 0 {
-		capacity := nodeCapacityForClass(a.class)
-		if capacity < minArenaNodeCap {
-			capacity = minArenaNodeCap
-		}
+		capacity := max(nodeCapacityForClass(a.class), minArenaNodeCap)
 		a.nodeSlabs = append(a.nodeSlabs, nodeSlab{data: make([]Node, capacity)})
 		a.nodeSlabCursor = 0
 	}
@@ -320,10 +318,7 @@ func (a *nodeArena) allocNodeSlow() *Node {
 	for i := a.nodeSlabCursor; ; i++ {
 		if i >= len(a.nodeSlabs) {
 			lastCap := len(a.nodeSlabs[len(a.nodeSlabs)-1].data)
-			capacity := lastCap * 2
-			if capacity < minArenaNodeCap {
-				capacity = minArenaNodeCap
-			}
+			capacity := max(lastCap*2, minArenaNodeCap)
 			a.nodeSlabs = append(a.nodeSlabs, nodeSlab{data: make([]Node, capacity)})
 		}
 
@@ -344,12 +339,11 @@ func (a *nodeArena) ensureNodeCapacity(min int) {
 		return
 	}
 	if a.used > 0 {
+		// Pre-sizing is only valid before the arena starts serving allocations.
+		// Calling this after allocation begins is an internal usage bug.
 		panic("ensureNodeCapacity called after arena allocations started")
 	}
-	newCap := len(a.nodes)
-	if newCap < minArenaNodeCap {
-		newCap = minArenaNodeCap
-	}
+	newCap := max(len(a.nodes), minArenaNodeCap)
 	for newCap < min {
 		newCap *= 2
 	}
@@ -377,10 +371,7 @@ func (a *nodeArena) allocNodeSlice(n int) []*Node {
 
 	for i := a.childSlabCursor; ; i++ {
 		if i >= len(a.childSlabs) {
-			capacity := defaultChildSliceCap(a.class)
-			if n > capacity {
-				capacity = n
-			}
+			capacity := max(defaultChildSliceCap(a.class), n)
 			a.childSlabs = append(a.childSlabs, childSliceSlab{data: make([]*Node, capacity)})
 		}
 
@@ -413,10 +404,7 @@ func (a *nodeArena) allocFieldIDSlice(n int) []FieldID {
 
 	for i := a.fieldSlabCursor; ; i++ {
 		if i >= len(a.fieldSlabs) {
-			capacity := defaultFieldSliceCap(a.class)
-			if n > capacity {
-				capacity = n
-			}
+			capacity := max(defaultFieldSliceCap(a.class), n)
 			a.fieldSlabs = append(a.fieldSlabs, fieldSliceSlab{data: make([]FieldID, capacity)})
 		}
 
@@ -461,25 +449,10 @@ func maxRetainedNodeCapacityForClass(class arenaClass) int {
 		factor = maxRetainedFullNodeArenaFactor
 		floor = maxRetainedFullNodeCap
 	}
-	capByFactor := nodeCapacityForClass(class) * factor
-	if capByFactor < floor {
-		return floor
-	}
-	return capByFactor
+	return max(nodeCapacityForClass(class)*factor, floor)
 }
 
 func maxRetainedOverflowNodeCapacityForClass(class arenaClass) int {
-	capacity := maxRetainedNodeCapacityForClass(class) / 2
-	if capacity < nodeCapacityForClass(class) {
-		return nodeCapacityForClass(class)
-	}
-	return capacity
+	return max(maxRetainedNodeCapacityForClass(class)/2, nodeCapacityForClass(class))
 }
 
-func maxRetainedChildSliceCapForClass(class arenaClass) int {
-	return defaultChildSliceCap(class) * maxRetainedArenaFactor
-}
-
-func maxRetainedFieldSliceCapForClass(class arenaClass) int {
-	return defaultFieldSliceCap(class) * maxRetainedArenaFactor
-}

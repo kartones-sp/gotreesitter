@@ -71,6 +71,8 @@ func NewExternalVMScanner(program ExternalVMProgram) (*ExternalVMScanner, error)
 }
 
 // MustNewExternalVMScanner is like NewExternalVMScanner but panics on error.
+// It is intended for package-level initialization where invalid programs are
+// programmer errors.
 func MustNewExternalVMScanner(program ExternalVMProgram) *ExternalVMScanner {
 	s, err := NewExternalVMScanner(program)
 	if err != nil {
@@ -298,28 +300,35 @@ func (s *ExternalVMScanner) Scan(payload any, lexer *ExternalLexer, validSymbols
 	return false
 }
 
+// VMFail constructs a fail instruction that terminates scan with no token.
 func VMFail() ExternalVMInstr { return ExternalVMInstr{Op: ExternalVMOpFail} }
 
+// VMJump constructs an unconditional branch to the target instruction index.
 func VMJump(target int) ExternalVMInstr {
 	return ExternalVMInstr{Op: ExternalVMOpJump, A: int32(target)}
 }
 
+// VMRequireValid constructs a valid-symbol guard with alternate branch on miss.
 func VMRequireValid(validSymbolIndex, alt int) ExternalVMInstr {
 	return ExternalVMInstr{Op: ExternalVMOpRequireValid, A: int32(validSymbolIndex), Alt: int32(alt)}
 }
 
+// VMRequireStateEq constructs a payload-state guard with alternate branch on miss.
 func VMRequireStateEq(state uint32, alt int) ExternalVMInstr {
 	return ExternalVMInstr{Op: ExternalVMOpRequireStateEq, A: int32(state), Alt: int32(alt)}
 }
 
+// VMSetState constructs a payload-state assignment instruction.
 func VMSetState(state uint32) ExternalVMInstr {
 	return ExternalVMInstr{Op: ExternalVMOpSetState, A: int32(state)}
 }
 
+// VMIfRuneEq constructs a rune-equality branch with alternate target on miss.
 func VMIfRuneEq(r rune, alt int) ExternalVMInstr {
 	return ExternalVMInstr{Op: ExternalVMOpIfRuneEq, A: int32(r), Alt: int32(alt)}
 }
 
+// VMIfRuneInRange constructs a rune-range branch with alternate target on miss.
 func VMIfRuneInRange(start, end rune, alt int) ExternalVMInstr {
 	return ExternalVMInstr{
 		Op:  ExternalVMOpIfRuneInRange,
@@ -329,10 +338,13 @@ func VMIfRuneInRange(start, end rune, alt int) ExternalVMInstr {
 	}
 }
 
+// VMIfRuneClass constructs a rune-class branch with alternate target on miss.
 func VMIfRuneClass(class ExternalVMRuneClass, alt int) ExternalVMInstr {
 	return ExternalVMInstr{Op: ExternalVMOpIfRuneClass, A: int32(class), Alt: int32(alt)}
 }
 
+// VMAdvance constructs an advance instruction. When skip is true, the
+// advanced rune is skipped from the token text.
 func VMAdvance(skip bool) ExternalVMInstr {
 	if skip {
 		return ExternalVMInstr{Op: ExternalVMOpAdvance, A: 1}
@@ -340,8 +352,10 @@ func VMAdvance(skip bool) ExternalVMInstr {
 	return ExternalVMInstr{Op: ExternalVMOpAdvance}
 }
 
+// VMMarkEnd constructs a mark-end instruction for the current token extent.
 func VMMarkEnd() ExternalVMInstr { return ExternalVMInstr{Op: ExternalVMOpMarkEnd} }
 
+// VMEmit constructs an emit instruction for the given symbol.
 func VMEmit(sym Symbol) ExternalVMInstr {
 	return ExternalVMInstr{Op: ExternalVMOpEmit, A: int32(sym)}
 }

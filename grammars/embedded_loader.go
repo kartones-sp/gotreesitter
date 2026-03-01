@@ -79,7 +79,7 @@ func loadEmbeddedLanguage(blobName string) *gotreesitter.Language {
 		}
 	})
 	if entry.err != nil {
-		panic(entry.err)
+		panic(fmt.Sprintf("gotreesitter: failed to load grammar %q: %v", blobName, entry.err))
 	}
 	recordEmbeddedLanguageUse(entry)
 	return entry.lang

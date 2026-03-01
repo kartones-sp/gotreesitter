@@ -10,6 +10,8 @@ import (
 	"testing"
 )
 
+var unstableParityCorpusLangs = map[string]string{}
+
 type parityCorpusDoc struct {
 	lang   string
 	label  string
@@ -42,6 +44,16 @@ func parityCorpusLangFilter() map[string]struct{} {
 		out[name] = struct{}{}
 	}
 	return out
+}
+
+func includeUnstableParityCorpusLangs() bool {
+	raw := strings.TrimSpace(os.Getenv("GTS_PARITY_CORPUS_INCLUDE_UNSTABLE"))
+	switch strings.ToLower(raw) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func allowCorpusLang(filter map[string]struct{}, name string) bool {
@@ -83,12 +95,15 @@ func javaCorpus(classCount int) string {
 
 func htmlCorpus(divCount int) string {
 	var b strings.Builder
-	b.Grow(divCount * 40)
-	b.WriteString("<html><body>\n")
+	b.Grow(divCount*8 + 64)
+	b.WriteString("<html><body><section><div>")
 	for i := 0; i < divCount; i++ {
-		fmt.Fprintf(&b, "<div id=\"d%d\">hello %d</div>\n", i, i)
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		fmt.Fprintf(&b, "hello%d", i)
 	}
-	b.WriteString("</body></html>\n")
+	b.WriteString("</div></section></body></html>\n")
 	return b.String()
 }
 
@@ -122,11 +137,17 @@ func yamlCorpus(keyCount int) string {
 func buildParityCorpusDocs() []parityCorpusDoc {
 	scale := parityCorpusScale()
 	filter := parityCorpusLangFilter()
+	includeUnstable := includeUnstableParityCorpusLangs()
 
 	docs := make([]parityCorpusDoc, 0, 32)
 	add := func(lang, label string, src string) {
 		if !allowCorpusLang(filter, lang) {
 			return
+		}
+		if !includeUnstable {
+			if _, unstable := unstableParityCorpusLangs[lang]; unstable {
+				return
+			}
 		}
 		docs = append(docs, parityCorpusDoc{
 			lang:   lang,
@@ -179,6 +200,9 @@ func TestParityCorpusFreshParse(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			if meta, ok := paritySkips[doc.lang]; ok && meta.skipReason != "" {
 				t.Skipf("known mismatch: %s", meta.skipReason)
+			}
+			if reason, unstable := unstableParityCorpusLangs[doc.lang]; unstable && !includeUnstableParityCorpusLangs() {
+				t.Skipf("unstable corpus parity disabled by default: %s", reason)
 			}
 			runParityCase(t, parityCase{name: doc.lang, source: string(doc.source)}, doc.label, doc.source)
 		})

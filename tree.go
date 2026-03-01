@@ -1,6 +1,7 @@
 package gotreesitter
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 )
@@ -33,6 +34,55 @@ type Node struct {
 	parent       *Node
 	childIndex   int
 	ownerArena   *nodeArena
+}
+
+// ParseStopReason reports why parseInternal terminated.
+type ParseStopReason string
+
+const (
+	ParseStopNone            ParseStopReason = "none"
+	ParseStopAccepted        ParseStopReason = "accepted"
+	ParseStopNoStacksAlive   ParseStopReason = "no_stacks_alive"
+	ParseStopTokenSourceEOF  ParseStopReason = "token_source_eof"
+	ParseStopIterationLimit  ParseStopReason = "iteration_limit"
+	ParseStopStackDepthLimit ParseStopReason = "stack_depth_limit"
+	ParseStopNodeLimit       ParseStopReason = "node_limit"
+)
+
+// ParseRuntime captures parser-loop diagnostics for a completed tree.
+type ParseRuntime struct {
+	StopReason          ParseStopReason
+	SourceLen           uint32
+	ExpectedEOFByte     uint32
+	RootEndByte         uint32
+	Truncated           bool
+	TokenSourceEOFEarly bool
+	TokensConsumed      uint64
+	LastTokenEndByte    uint32
+	LastTokenSymbol     Symbol
+	LastTokenWasEOF     bool
+	IterationLimit      int
+	StackDepthLimit     int
+	NodeLimit           int
+	Iterations          int
+	NodesAllocated      int
+	PeakStackDepth      int
+	MaxStacksSeen       int
+}
+
+// Summary returns a stable one-line diagnostic string for parse-runtime stats.
+func (rt ParseRuntime) Summary() string {
+	stopReason := rt.StopReason
+	if stopReason == "" {
+		stopReason = ParseStopNone
+	}
+	return fmt.Sprintf(
+		"truncated=%v stopReason=%s tokenEOFEarly=%v tokens=%d lastTokenEnd=%d expectedEOF=%d lastTokenSymbol=%d lastTokenEOF=%v iterations=%d/%d nodes=%d/%d peakDepth=%d/%d maxStacks=%d",
+		rt.Truncated, stopReason, rt.TokenSourceEOFEarly, rt.TokensConsumed,
+		rt.LastTokenEndByte, rt.ExpectedEOFByte, rt.LastTokenSymbol, rt.LastTokenWasEOF,
+		rt.Iterations, rt.IterationLimit, rt.NodesAllocated, rt.NodeLimit,
+		rt.PeakStackDepth, rt.StackDepthLimit, rt.MaxStacksSeen,
+	)
 }
 
 // Symbol returns the node's grammar symbol.
@@ -388,9 +438,92 @@ func populateParentNode(n *Node, children []*Node) {
 			c.childIndex = i
 			if c.hasError {
 				n.hasError = true
+				break
 			}
 		}
 	}
+}
+
+// populateParentNodeNoLinks computes parent span/error metadata from children
+// without wiring child.parent/childIndex links. Used on deferred-link paths.
+func populateParentNodeNoLinks(n *Node, children []*Node, trackChildErrors bool) {
+	switch len(children) {
+	case 0:
+		return
+	case 1:
+		c0 := children[0]
+		n.startByte = c0.startByte
+		n.endByte = c0.endByte
+		n.startPoint = c0.startPoint
+		n.endPoint = c0.endPoint
+		if trackChildErrors {
+			n.hasError = c0.hasError
+		}
+		return
+	case 2:
+		c0 := children[0]
+		c1 := children[1]
+		n.startByte = c0.startByte
+		n.endByte = c1.endByte
+		n.startPoint = c0.startPoint
+		n.endPoint = c1.endPoint
+		if trackChildErrors {
+			n.hasError = c0.hasError || c1.hasError
+		}
+		return
+	default:
+		first := children[0]
+		last := children[len(children)-1]
+		n.startByte = first.startByte
+		n.endByte = last.endByte
+		n.startPoint = first.startPoint
+		n.endPoint = last.endPoint
+		if trackChildErrors {
+			for i := range children {
+				if children[i].hasError {
+					n.hasError = true
+					break
+				}
+			}
+		}
+	}
+}
+
+func wireParentLinksWithScratch(root *Node, scratch *[]*Node) {
+	if root == nil {
+		return
+	}
+	root.parent = nil
+	root.childIndex = -1
+
+	var stack []*Node
+	if scratch != nil {
+		stack = (*scratch)[:0]
+	} else {
+		var local [64]*Node
+		stack = local[:0]
+	}
+	stack = append(stack, root)
+	for len(stack) > 0 {
+		n := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		for i := range n.children {
+			c := n.children[i]
+			if c == nil {
+				continue
+			}
+			c.parent = n
+			c.childIndex = i
+			stack = append(stack, c)
+		}
+	}
+	if scratch != nil {
+		*scratch = stack[:0]
+	}
+}
+
+func wireParentLinks(root *Node) {
+	wireParentLinksWithScratch(root, nil)
 }
 
 func newParentNode(arena *nodeArena, sym Symbol, named bool, children []*Node, fieldIDs []FieldID, productionID uint16) *Node {
@@ -454,6 +587,9 @@ func newParentNodeInArena(arena *nodeArena, sym Symbol, named bool, children []*
 	if arena == nil {
 		return newParentNode(nil, sym, named, children, fieldIDs, productionID)
 	}
+	if perfCountersEnabled {
+		perfRecordParentChildren(len(children))
+	}
 	n := arena.allocNodeFast()
 	n.ownerArena = arena
 	n.symbol = sym
@@ -466,7 +602,28 @@ func newParentNodeInArena(arena *nodeArena, sym Symbol, named bool, children []*
 	return n
 }
 
+func newParentNodeInArenaNoLinks(arena *nodeArena, sym Symbol, named bool, children []*Node, fieldIDs []FieldID, productionID uint16, trackChildErrors bool) *Node {
+	if arena == nil {
+		return newParentNode(nil, sym, named, children, fieldIDs, productionID)
+	}
+	if perfCountersEnabled {
+		perfRecordParentChildren(len(children))
+	}
+	n := arena.allocNodeFast()
+	n.ownerArena = arena
+	n.symbol = sym
+	n.isNamed = named
+	n.children = children
+	n.fieldIDs = fieldIDs
+	n.productionID = productionID
+	n.childIndex = -1
+	populateParentNodeNoLinks(n, children, trackChildErrors)
+	return n
+}
+
 // Tree holds a complete syntax tree along with its source text and language.
+// Tree is safe for concurrent reads after construction. Edit and Release are
+// not safe for concurrent use.
 type Tree struct {
 	root          *Node
 	source        []byte
@@ -474,6 +631,7 @@ type Tree struct {
 	edits         []InputEdit  // pending edits applied to this tree
 	arena         *nodeArena   // primary arena that owns newly-built nodes
 	borrowedArena []*nodeArena // arenas borrowed via subtree reuse
+	parseRuntime  ParseRuntime
 	released      bool
 }
 
@@ -552,6 +710,49 @@ func (t *Tree) Source() []byte { return t.source }
 
 // Language returns the language used to parse this tree.
 func (t *Tree) Language() *Language { return t.language }
+
+// ParseStopReason reports why parsing terminated.
+func (t *Tree) ParseStopReason() ParseStopReason {
+	if t == nil {
+		return ParseStopNone
+	}
+	if t.parseRuntime.StopReason == "" {
+		return ParseStopNone
+	}
+	return t.parseRuntime.StopReason
+}
+
+// ParseStoppedEarly reports whether parsing hit an early-stop condition.
+func (t *Tree) ParseStoppedEarly() bool {
+	switch t.ParseStopReason() {
+	case ParseStopIterationLimit, ParseStopStackDepthLimit, ParseStopNodeLimit, ParseStopTokenSourceEOF:
+		return true
+	default:
+		return false
+	}
+}
+
+// ParseRuntime returns parser-loop diagnostics captured when this tree was built.
+func (t *Tree) ParseRuntime() ParseRuntime {
+	if t == nil {
+		return ParseRuntime{StopReason: ParseStopNone}
+	}
+	out := t.parseRuntime
+	if out.StopReason == "" {
+		out.StopReason = ParseStopNone
+	}
+	return out
+}
+
+func (t *Tree) setParseRuntime(rt ParseRuntime) {
+	if t == nil {
+		return
+	}
+	if rt.StopReason == "" {
+		rt.StopReason = ParseStopNone
+	}
+	t.parseRuntime = rt
+}
 
 // InputEdit describes a single edit to the source text. It tells the parser
 // what byte range was replaced and what the new range looks like, so the
@@ -637,8 +838,11 @@ func coalesceRanges(in []Range) []Range {
 // marks nodes that overlap the edited region as dirty.
 func editNode(n *Node, edit InputEdit) {
 	byteDelta := int64(edit.NewEndByte) - int64(edit.OldEndByte)
+	rowDelta := int64(edit.NewEndPoint.Row) - int64(edit.OldEndPoint.Row)
+	colDelta := int64(edit.NewEndPoint.Column) - int64(edit.OldEndPoint.Column)
 	hasTailShift := byteDelta != 0 || edit.NewEndPoint != edit.OldEndPoint
-	editNodeWithDelta(n, edit, byteDelta, hasTailShift)
+	var shiftScratch []*Node
+	editNodeWithDelta(n, edit, byteDelta, rowDelta, colDelta, hasTailShift, &shiftScratch)
 }
 
 func addUint32Delta(value uint32, delta int64) uint32 {
@@ -652,7 +856,7 @@ func addUint32Delta(value uint32, delta int64) uint32 {
 	return uint32(next)
 }
 
-func editNodeWithDelta(n *Node, edit InputEdit, byteDelta int64, hasTailShift bool) {
+func editNodeWithDelta(n *Node, edit InputEdit, byteDelta, rowDelta, colDelta int64, hasTailShift bool, shiftScratch *[]*Node) {
 	// If the node ends before the edit starts, it's completely unaffected.
 	if n.endByte <= edit.StartByte {
 		return
@@ -667,22 +871,18 @@ func editNodeWithDelta(n *Node, edit InputEdit, byteDelta int64, hasTailShift bo
 		n.endByte = addUint32Delta(n.endByte, byteDelta)
 		// Shift points approximately (row stays, col shifts if same row).
 		if n.startPoint.Row == edit.OldEndPoint.Row {
-			rowDelta := int64(edit.NewEndPoint.Row) - int64(edit.OldEndPoint.Row)
 			n.startPoint.Row = addUint32Delta(n.startPoint.Row, rowDelta)
 			if rowDelta == 0 {
-				colDelta := int64(edit.NewEndPoint.Column) - int64(edit.OldEndPoint.Column)
 				n.startPoint.Column = addUint32Delta(n.startPoint.Column, colDelta)
 			}
 		}
 		if n.endPoint.Row == edit.OldEndPoint.Row {
-			rowDelta := int64(edit.NewEndPoint.Row) - int64(edit.OldEndPoint.Row)
 			n.endPoint.Row = addUint32Delta(n.endPoint.Row, rowDelta)
 			if rowDelta == 0 {
-				colDelta := int64(edit.NewEndPoint.Column) - int64(edit.OldEndPoint.Column)
 				n.endPoint.Column = addUint32Delta(n.endPoint.Column, colDelta)
 			}
 		}
-		shiftSubtreeAfterEdit(n.children, edit, byteDelta)
+		shiftSubtreeAfterEdit(n.children, edit, byteDelta, rowDelta, colDelta, shiftScratch)
 		return
 	}
 
@@ -706,19 +906,22 @@ func editNodeWithDelta(n *Node, edit InputEdit, byteDelta int64, hasTailShift bo
 			if !hasTailShift {
 				continue
 			}
-			shiftSubtreeAfterEdit([]*Node{c}, edit, byteDelta)
+			shiftSubtreeNodeAfterEdit(c, edit, byteDelta, rowDelta, colDelta, shiftScratch)
 			continue
 		}
-		editNodeWithDelta(c, edit, byteDelta, hasTailShift)
+		editNodeWithDelta(c, edit, byteDelta, rowDelta, colDelta, hasTailShift, shiftScratch)
 	}
 }
 
-func shiftSubtreeAfterEdit(roots []*Node, edit InputEdit, byteDelta int64) {
+func shiftSubtreeAfterEdit(roots []*Node, edit InputEdit, byteDelta, rowDelta, colDelta int64, shiftScratch *[]*Node) {
 	if len(roots) == 0 {
 		return
 	}
 
-	stack := make([]*Node, 0, len(roots)*2)
+	var stack [](*Node)
+	if shiftScratch != nil {
+		stack = (*shiftScratch)[:0]
+	}
 	stack = append(stack, roots...)
 	for len(stack) > 0 {
 		n := stack[len(stack)-1]
@@ -728,18 +931,14 @@ func shiftSubtreeAfterEdit(roots []*Node, edit InputEdit, byteDelta int64) {
 		n.endByte = addUint32Delta(n.endByte, byteDelta)
 
 		if n.startPoint.Row == edit.OldEndPoint.Row {
-			rowDelta := int64(edit.NewEndPoint.Row) - int64(edit.OldEndPoint.Row)
 			n.startPoint.Row = addUint32Delta(n.startPoint.Row, rowDelta)
 			if rowDelta == 0 {
-				colDelta := int64(edit.NewEndPoint.Column) - int64(edit.OldEndPoint.Column)
 				n.startPoint.Column = addUint32Delta(n.startPoint.Column, colDelta)
 			}
 		}
 		if n.endPoint.Row == edit.OldEndPoint.Row {
-			rowDelta := int64(edit.NewEndPoint.Row) - int64(edit.OldEndPoint.Row)
 			n.endPoint.Row = addUint32Delta(n.endPoint.Row, rowDelta)
 			if rowDelta == 0 {
-				colDelta := int64(edit.NewEndPoint.Column) - int64(edit.OldEndPoint.Column)
 				n.endPoint.Column = addUint32Delta(n.endPoint.Column, colDelta)
 			}
 		}
@@ -748,4 +947,108 @@ func shiftSubtreeAfterEdit(roots []*Node, edit InputEdit, byteDelta int64) {
 			stack = append(stack, c)
 		}
 	}
+	if shiftScratch != nil {
+		*shiftScratch = stack[:0]
+	}
+}
+
+func shiftSubtreeNodeAfterEdit(root *Node, edit InputEdit, byteDelta, rowDelta, colDelta int64, shiftScratch *[]*Node) {
+	if root == nil {
+		return
+	}
+	var roots [1]*Node
+	roots[0] = root
+	shiftSubtreeAfterEdit(roots[:], edit, byteDelta, rowDelta, colDelta, shiftScratch)
+}
+
+// DiffChangedRanges compares two syntax trees and returns the minimal
+// ranges where syntactic structure differs. The old tree should have been
+// edited (via Tree.Edit) to match the new tree's source positions before
+// reparsing.
+//
+// This is equivalent to C tree-sitter's ts_tree_get_changed_ranges().
+func DiffChangedRanges(oldTree, newTree *Tree) []Range {
+	if oldTree == nil || newTree == nil {
+		return nil
+	}
+	oldRoot := oldTree.RootNode()
+	newRoot := newTree.RootNode()
+	if oldRoot == nil || newRoot == nil {
+		return nil
+	}
+
+	var ranges []Range
+	diffNodes(oldRoot, newRoot, &ranges)
+	return coalesceRanges(ranges)
+}
+
+// diffNodes recursively compares old and new tree nodes, appending changed
+// ranges when structural differences are found.
+func diffNodes(oldNode, newNode *Node, ranges *[]Range) {
+	// If both nodes are structurally identical, nothing changed.
+	if nodesStructurallyEqual(oldNode, newNode) {
+		return
+	}
+
+	// If they differ at the symbol level or child count, the entire range is changed.
+	if oldNode.Symbol() != newNode.Symbol() ||
+		oldNode.ChildCount() != newNode.ChildCount() {
+		addChangedRange(oldNode, newNode, ranges)
+		return
+	}
+
+	// Leaf nodes (no children) that are not structurally equal: they differ in
+	// byte range or one of them has been marked dirty. Report the range.
+	if oldNode.ChildCount() == 0 {
+		addChangedRange(oldNode, newNode, ranges)
+		return
+	}
+
+	// Same symbol and child count — recurse into children.
+	for i := 0; i < oldNode.ChildCount(); i++ {
+		oldChild := oldNode.Child(i)
+		newChild := newNode.Child(i)
+		diffNodes(oldChild, newChild, ranges)
+	}
+}
+
+// nodesStructurallyEqual reports whether two nodes are structurally identical
+// and can be skipped during diff. Two nodes are equal if they have the same
+// symbol, the same byte range, the same child count, and neither has been
+// marked as changed by Tree.Edit.
+func nodesStructurallyEqual(a, b *Node) bool {
+	if a.Symbol() != b.Symbol() {
+		return false
+	}
+	if a.StartByte() != b.StartByte() || a.EndByte() != b.EndByte() {
+		return false
+	}
+	if a.ChildCount() != b.ChildCount() {
+		return false
+	}
+	// Fast path: if neither node has changes, they're equal.
+	if !a.HasChanges() && !b.HasChanges() {
+		return true
+	}
+	return false
+}
+
+// addChangedRange records a changed range covering both the old and new node spans.
+func addChangedRange(oldNode, newNode *Node, ranges *[]Range) {
+	startByte := min(oldNode.StartByte(), newNode.StartByte())
+	endByte := max(oldNode.EndByte(), newNode.EndByte())
+	startPoint := oldNode.StartPoint()
+	endPoint := newNode.EndPoint()
+	if newNode.StartByte() < oldNode.StartByte() {
+		startPoint = newNode.StartPoint()
+	}
+	if oldNode.EndByte() > newNode.EndByte() {
+		endPoint = oldNode.EndPoint()
+	}
+	*ranges = append(*ranges, Range{
+		StartByte:  startByte,
+		EndByte:    endByte,
+		StartPoint: startPoint,
+		EndPoint:   endPoint,
+	})
 }

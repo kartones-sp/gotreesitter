@@ -59,6 +59,19 @@ func benchmarkFuncCount(b *testing.B) int {
 	return 500
 }
 
+func effectiveGLRMaxStacksForStats() int {
+	const defaultGLRMaxStacks = 6
+	raw := strings.TrimSpace(os.Getenv("GOT_GLR_MAX_STACKS"))
+	if raw == "" {
+		return defaultGLRMaxStacks
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return defaultGLRMaxStacks
+	}
+	return n
+}
+
 func nonZeroBins(hist []uint64) string {
 	var sb strings.Builder
 	first := true
@@ -128,6 +141,23 @@ func mustGoTokenSource(tb testing.TB, src []byte, lang *gotreesitter.Language) *
 	return ts
 }
 
+func requireCompleteParse(tb testing.TB, tree *gotreesitter.Tree, src []byte, lang *gotreesitter.Language, phase string) *gotreesitter.Node {
+	tb.Helper()
+	if tree == nil {
+		tb.Fatalf("%s parse returned nil tree", phase)
+	}
+	root := tree.RootNode()
+	if root == nil {
+		tb.Fatalf("%s parse returned nil root", phase)
+	}
+	if got, want := root.EndByte(), uint32(len(src)); got != want {
+		rt := tree.ParseRuntime()
+		tb.Fatalf("%s parse truncated: root.EndByte=%d want=%d type=%q hasError=%v %s",
+			phase, got, want, root.Type(lang), root.HasError(), rt.Summary())
+	}
+	return root
+}
+
 func BenchmarkGoParseFull(b *testing.B) {
 	lang := grammars.GoLanguage()
 	parser := gotreesitter.NewParser(lang)
@@ -144,9 +174,7 @@ func BenchmarkGoParseFull(b *testing.B) {
 		if err != nil {
 			b.Fatalf("parse error: %v", err)
 		}
-		if tree.RootNode() == nil {
-			b.Fatal("parse returned nil root")
-		}
+		requireCompleteParse(b, tree, src, lang, "full token-source")
 		tree.Release()
 	}
 }
@@ -167,30 +195,46 @@ func BenchmarkGoParseFullDFA(b *testing.B) {
 	b.SetBytes(int64(len(src)))
 	b.ResetTimer()
 
+	var lastRuntime gotreesitter.ParseRuntime
 	for i := 0; i < b.N; i++ {
 		tree, err := parser.Parse(src)
 		if err != nil {
 			b.Fatalf("parse error: %v", err)
 		}
-		if tree.RootNode() == nil {
-			b.Fatal("parse returned nil root")
-		}
+		requireCompleteParse(b, tree, src, lang, "full dfa")
+		lastRuntime = tree.ParseRuntime()
 		tree.Release()
 	}
 	if statsEnabled {
 		a := gotreesitter.ArenaProfileSnapshot()
 		p := gotreesitter.PerfCountersSnapshot()
 		fmt.Printf(
+			"STATS_CFG glr_max_stacks=%d default=6\n",
+			effectiveGLRMaxStacksForStats(),
+		)
+		fmt.Printf(
 			"STATS arena_full_acquire=%d arena_full_new=%d arena_inc_acquire=%d arena_inc_new=%d\n",
 			a.FullAcquire, a.FullNew, a.IncrementalAcquire, a.IncrementalNew,
 		)
 		fmt.Printf(
-			"STATS_PERF merge_calls=%d merge_dead_pruned=%d merge_perkey_overflow=%d merge_replacements=%d stackeq_calls=%d stackeq_true=%d stackcmp_calls=%d forks=%d first_conflict_token=%d max_stacks=%d lex_bytes=%d lex_tokens=%d\n",
-			p.MergeCalls, p.MergeDeadPruned, p.MergePerKeyOverflow, p.MergeReplacements, p.StackEquivalentCalls, p.StackEquivalentTrue, p.StackCompareCalls, p.ForkCount, p.FirstConflictToken, p.MaxConcurrentStacks, p.LexBytes, p.LexTokens,
+			"STATS_PERF merge_calls=%d merge_dead_pruned=%d merge_perkey_overflow=%d merge_replacements=%d stackeq_calls=%d stackeq_true=%d stackeq_hash_miss_skips=%d stackcmp_calls=%d forks=%d first_conflict_token=%d max_stacks=%d lex_bytes=%d lex_tokens=%d\n",
+			p.MergeCalls, p.MergeDeadPruned, p.MergePerKeyOverflow, p.MergeReplacements, p.StackEquivalentCalls, p.StackEquivalentTrue, p.StackEqHashMissSkips, p.StackCompareCalls, p.ForkCount, p.FirstConflictToken, p.MaxConcurrentStacks, p.LexBytes, p.LexTokens,
 		)
 		fmt.Printf(
-			"STATS_PERF merge_in_hist=%s merge_alive_hist=%s fork_actions_hist=%s\n",
-			nonZeroBins(p.MergeStacksInHist[:]), nonZeroBins(p.MergeAliveHist[:]), nonZeroBins(p.ForkActionsHist[:]),
+			"STATS_PERF merge_hash_zero=%d global_cap_culls=%d global_cap_cull_dropped=%d\n",
+			p.MergeHashZero, p.GlobalCapCulls, p.GlobalCapCullDropped,
+		)
+		fmt.Printf(
+			"STATS_PERF conflicts_rr=%d conflicts_rs=%d conflicts_other=%d reduce_chain_steps=%d reduce_chain_max_len=%d reduce_chain_break_multi=%d reduce_chain_break_shift=%d reduce_chain_break_accept=%d\n",
+			p.ConflictRR, p.ConflictRS, p.ConflictOther, p.ReduceChainSteps, p.ReduceChainMaxLen, p.ReduceChainBreakMulti, p.ReduceChainBreakShift, p.ReduceChainBreakAccept,
+		)
+		fmt.Printf(
+			"STATS_PERF merge_in_hist=%s merge_alive_hist=%s merge_out_hist=%s fork_actions_hist=%s\n",
+			nonZeroBins(p.MergeStacksInHist[:]), nonZeroBins(p.MergeAliveHist[:]), nonZeroBins(p.MergeOutHist[:]), nonZeroBins(p.ForkActionsHist[:]),
+		)
+		fmt.Printf(
+			"STATS_PARSE nodes_new=%d children_ptrs=%d extras=%d errors=%d reuse_bytes=%d max_stacks=%d\n",
+			lastRuntime.NodesAllocated, p.ParentChildPointers, p.ExtraNodes, p.ErrorNodes, p.ReuseNonLeafBytes, lastRuntime.MaxStacksSeen,
 		)
 	}
 }
@@ -365,6 +409,10 @@ func BenchmarkGoParseIncrementalSingleByteEditDFA(b *testing.B) {
 		a := gotreesitter.ArenaProfileSnapshot()
 		p := gotreesitter.PerfCountersSnapshot()
 		fmt.Printf(
+			"STATS_CFG glr_max_stacks=%d default=6\n",
+			effectiveGLRMaxStacksForStats(),
+		)
+		fmt.Printf(
 			"STATS edits=%d edit_ns=%d reuse_ns=%d parse_ns=%d reused_subtrees=%d reused_bytes=%d new_nodes=%d recover_searches=%d recover_state_checks=%d recover_state_skips=%d recover_lookups=%d recover_hits=%d max_stacks=%d\n",
 			b.N, editTotalNS, reuseTotalNS, parseTotalNS, reusedSubtrees, reusedBytes, newNodesAllocated, recoverSearches, recoverStateChecks, recoverStateSkips, recoverLookups, recoverHits, maxStacksSeen,
 		)
@@ -381,12 +429,20 @@ func BenchmarkGoParseIncrementalSingleByteEditDFA(b *testing.B) {
 			entryScratchPeak,
 		)
 		fmt.Printf(
-			"STATS_PERF merge_calls=%d merge_dead_pruned=%d merge_perkey_overflow=%d merge_replacements=%d stackeq_calls=%d stackeq_true=%d stackcmp_calls=%d forks=%d first_conflict_token=%d max_stacks=%d lex_bytes=%d lex_tokens=%d reuse_nodes_visited=%d reuse_nodes_pushed=%d reuse_nodes_popped=%d reuse_candidates=%d reuse_successes=%d reuse_leaf_successes=%d reuse_nonleaf_checks=%d reuse_nonleaf_successes=%d reuse_nonleaf_bytes=%d reuse_nonleaf_nogoto=%d reuse_nonleaf_nogoto_term=%d reuse_nonleaf_nogoto_nonterm=%d reuse_nonleaf_statemiss=%d reuse_nonleaf_statezero=%d\n",
-			p.MergeCalls, p.MergeDeadPruned, p.MergePerKeyOverflow, p.MergeReplacements, p.StackEquivalentCalls, p.StackEquivalentTrue, p.StackCompareCalls, p.ForkCount, p.FirstConflictToken, p.MaxConcurrentStacks, p.LexBytes, p.LexTokens, p.ReuseNodesVisited, p.ReuseNodesPushed, p.ReuseNodesPopped, p.ReuseCandidatesChecked, p.ReuseSuccesses, p.ReuseLeafSuccesses, p.ReuseNonLeafChecks, p.ReuseNonLeafSuccesses, p.ReuseNonLeafBytes, p.ReuseNonLeafNoGoto, p.ReuseNonLeafNoGotoTerm, p.ReuseNonLeafNoGotoNt, p.ReuseNonLeafStateMiss, p.ReuseNonLeafStateZero,
+			"STATS_PERF merge_calls=%d merge_dead_pruned=%d merge_perkey_overflow=%d merge_replacements=%d stackeq_calls=%d stackeq_true=%d stackeq_hash_miss_skips=%d stackcmp_calls=%d forks=%d first_conflict_token=%d max_stacks=%d lex_bytes=%d lex_tokens=%d reuse_nodes_visited=%d reuse_nodes_pushed=%d reuse_nodes_popped=%d reuse_candidates=%d reuse_successes=%d reuse_leaf_successes=%d reuse_nonleaf_checks=%d reuse_nonleaf_successes=%d reuse_nonleaf_bytes=%d reuse_nonleaf_nogoto=%d reuse_nonleaf_nogoto_term=%d reuse_nonleaf_nogoto_nonterm=%d reuse_nonleaf_statemiss=%d reuse_nonleaf_statezero=%d\n",
+			p.MergeCalls, p.MergeDeadPruned, p.MergePerKeyOverflow, p.MergeReplacements, p.StackEquivalentCalls, p.StackEquivalentTrue, p.StackEqHashMissSkips, p.StackCompareCalls, p.ForkCount, p.FirstConflictToken, p.MaxConcurrentStacks, p.LexBytes, p.LexTokens, p.ReuseNodesVisited, p.ReuseNodesPushed, p.ReuseNodesPopped, p.ReuseCandidatesChecked, p.ReuseSuccesses, p.ReuseLeafSuccesses, p.ReuseNonLeafChecks, p.ReuseNonLeafSuccesses, p.ReuseNonLeafBytes, p.ReuseNonLeafNoGoto, p.ReuseNonLeafNoGotoTerm, p.ReuseNonLeafNoGotoNt, p.ReuseNonLeafStateMiss, p.ReuseNonLeafStateZero,
 		)
 		fmt.Printf(
-			"STATS_PERF merge_in_hist=%s merge_alive_hist=%s fork_actions_hist=%s\n",
-			nonZeroBins(p.MergeStacksInHist[:]), nonZeroBins(p.MergeAliveHist[:]), nonZeroBins(p.ForkActionsHist[:]),
+			"STATS_PERF merge_hash_zero=%d global_cap_culls=%d global_cap_cull_dropped=%d\n",
+			p.MergeHashZero, p.GlobalCapCulls, p.GlobalCapCullDropped,
+		)
+		fmt.Printf(
+			"STATS_PERF conflicts_rr=%d conflicts_rs=%d conflicts_other=%d reduce_chain_steps=%d reduce_chain_max_len=%d reduce_chain_break_multi=%d reduce_chain_break_shift=%d reduce_chain_break_accept=%d\n",
+			p.ConflictRR, p.ConflictRS, p.ConflictOther, p.ReduceChainSteps, p.ReduceChainMaxLen, p.ReduceChainBreakMulti, p.ReduceChainBreakShift, p.ReduceChainBreakAccept,
+		)
+		fmt.Printf(
+			"STATS_PERF merge_in_hist=%s merge_alive_hist=%s merge_out_hist=%s fork_actions_hist=%s\n",
+			nonZeroBins(p.MergeStacksInHist[:]), nonZeroBins(p.MergeAliveHist[:]), nonZeroBins(p.MergeOutHist[:]), nonZeroBins(p.ForkActionsHist[:]),
 		)
 	}
 	tree.Release()

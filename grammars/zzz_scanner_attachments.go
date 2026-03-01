@@ -102,6 +102,7 @@ func init() {
 		"gdscript":        GdscriptExternalScanner{},
 		"elm":             ElmExternalScanner{},
 		"disassembly":     DisassemblyExternalScanner{},
+		"norg":            NorgExternalScanner{},
 		"bitbake":         BitbakeExternalScanner{},
 		"scala":           ScalaExternalScanner{},
 		"php":             PhpExternalScanner{},
@@ -129,6 +130,7 @@ func init() {
 		"haskell":         HaskellExternalScanner{},
 		"vhdl":            VhdlExternalScanner{},
 		"html":            HTMLExternalScanner{},
+		"yaml":            YamlExternalScanner{},
 	}
 
 	// Register scanners in the embedded loader's registry so that direct

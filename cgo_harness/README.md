@@ -5,7 +5,13 @@ This module contains CGo-only parity and baseline benchmark harnesses used to co
 ## Run Parity Tests
 
 ```sh
-go test . -tags treesitter_c_parity -run TestParity -v
+go test . -tags treesitter_c_parity \
+  -run '^TestParityFreshParse$|^TestParityHasNoErrors$|^TestParityIssue3Repros$|^TestParityGLRCanaryGo$' \
+  -count=1 -v
+
+go test . -tags treesitter_c_parity \
+  -run '^TestParityCorpusFreshParse$' \
+  -count=1 -v
 ```
 
 ## Run Corpus Parity (`dump.v1`)
@@ -24,13 +30,16 @@ go run -tags treesitter_c_parity ./cmd/corpus_parity \
 
 Notes:
 
+- `--lang` accepts `top10` (default), a single language (`go`), or a comma-separated list.
 - For multiple languages, corpus layout is `--corpus/<language>/**`.
 - For a single language (`--lang go`), `--corpus` can point directly at that language directory.
 
 ## Run C Baseline Benchmarks
 
 ```sh
-go test . -run '^$' -tags treesitter_c_bench -bench BenchmarkCTreeSitter -benchmem
+GOMAXPROCS=1 go test . -run '^$' -tags treesitter_c_bench \
+  -bench 'BenchmarkCTreeSitterGoParseFull|BenchmarkCTreeSitterGoParseIncrementalSingleByteEdit|BenchmarkCTreeSitterGoParseIncrementalNoEdit' \
+  -benchmem -count=10 -benchtime=750ms
 ```
 
 These harnesses are intentionally split into a separate module so the root `gotreesitter` module remains pure-Go in dependency metadata.

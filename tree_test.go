@@ -384,6 +384,216 @@ func TestOutOfRange(t *testing.T) {
 	}
 }
 
+func TestDiffChangedRangesIdenticalTrees(t *testing.T) {
+	lang := testLanguage()
+	// Build two identical trees: program -> [identifier, number]
+	oldLeaf0 := NewLeafNode(Symbol(1), true, 0, 3, Point{Row: 0, Column: 0}, Point{Row: 0, Column: 3})
+	oldLeaf1 := NewLeafNode(Symbol(2), true, 4, 7, Point{Row: 0, Column: 4}, Point{Row: 0, Column: 7})
+	oldRoot := NewParentNode(Symbol(4), true, []*Node{oldLeaf0, oldLeaf1}, nil, 0)
+	oldTree := NewTree(oldRoot, []byte("abc def"), lang)
+
+	newLeaf0 := NewLeafNode(Symbol(1), true, 0, 3, Point{Row: 0, Column: 0}, Point{Row: 0, Column: 3})
+	newLeaf1 := NewLeafNode(Symbol(2), true, 4, 7, Point{Row: 0, Column: 4}, Point{Row: 0, Column: 7})
+	newRoot := NewParentNode(Symbol(4), true, []*Node{newLeaf0, newLeaf1}, nil, 0)
+	newTree := NewTree(newRoot, []byte("abc def"), lang)
+
+	ranges := DiffChangedRanges(oldTree, newTree)
+	if len(ranges) != 0 {
+		t.Fatalf("identical trees: got %d ranges, want 0", len(ranges))
+	}
+}
+
+func TestDiffChangedRangesLeafChanged(t *testing.T) {
+	lang := testLanguage()
+
+	// Old tree: program -> [identifier(0-3), number(4-7)]
+	oldLeaf0 := NewLeafNode(Symbol(1), true, 0, 3, Point{Row: 0, Column: 0}, Point{Row: 0, Column: 3})
+	oldLeaf1 := NewLeafNode(Symbol(2), true, 4, 7, Point{Row: 0, Column: 4}, Point{Row: 0, Column: 7})
+	oldRoot := NewParentNode(Symbol(4), true, []*Node{oldLeaf0, oldLeaf1}, nil, 0)
+	oldTree := NewTree(oldRoot, []byte("abc 123"), lang)
+
+	// Simulate an edit in the second leaf: "123" -> "4567" (bytes 4-7 -> 4-8)
+	oldTree.Edit(InputEdit{
+		StartByte:   4,
+		OldEndByte:  7,
+		NewEndByte:  8,
+		StartPoint:  Point{Row: 0, Column: 4},
+		OldEndPoint: Point{Row: 0, Column: 7},
+		NewEndPoint: Point{Row: 0, Column: 8},
+	})
+
+	// New tree: program -> [identifier(0-3), number(4-8)]
+	newLeaf0 := NewLeafNode(Symbol(1), true, 0, 3, Point{Row: 0, Column: 0}, Point{Row: 0, Column: 3})
+	newLeaf1 := NewLeafNode(Symbol(2), true, 4, 8, Point{Row: 0, Column: 4}, Point{Row: 0, Column: 8})
+	newRoot := NewParentNode(Symbol(4), true, []*Node{newLeaf0, newLeaf1}, nil, 0)
+	newTree := NewTree(newRoot, []byte("abc 4567"), lang)
+
+	ranges := DiffChangedRanges(oldTree, newTree)
+	if len(ranges) != 1 {
+		t.Fatalf("leaf change: got %d ranges, want 1", len(ranges))
+	}
+	// The changed range should cover bytes 4-8 (the union of old 4-8 edited + new 4-8)
+	if ranges[0].StartByte != 4 || ranges[0].EndByte != 8 {
+		t.Fatalf("leaf change range: got %d-%d, want 4-8", ranges[0].StartByte, ranges[0].EndByte)
+	}
+}
+
+func TestDiffChangedRangesStructureChanged(t *testing.T) {
+	lang := testLanguage()
+
+	// Old tree: program -> [identifier(0-3), number(4-7)]
+	oldLeaf0 := NewLeafNode(Symbol(1), true, 0, 3, Point{Row: 0, Column: 0}, Point{Row: 0, Column: 3})
+	oldLeaf1 := NewLeafNode(Symbol(2), true, 4, 7, Point{Row: 0, Column: 4}, Point{Row: 0, Column: 7})
+	oldRoot := NewParentNode(Symbol(4), true, []*Node{oldLeaf0, oldLeaf1}, nil, 0)
+	oldTree := NewTree(oldRoot, []byte("abc 123"), lang)
+
+	// Simulate an edit — mark the root as dirty
+	oldTree.Edit(InputEdit{
+		StartByte:   0,
+		OldEndByte:  7,
+		NewEndByte:  11,
+		StartPoint:  Point{Row: 0, Column: 0},
+		OldEndPoint: Point{Row: 0, Column: 7},
+		NewEndPoint: Point{Row: 0, Column: 11},
+	})
+
+	// New tree: program -> [identifier(0-3), expression(4-7), number(8-11)]
+	// Different child count (3 vs 2) -> entire root range reported
+	newLeaf0 := NewLeafNode(Symbol(1), true, 0, 3, Point{Row: 0, Column: 0}, Point{Row: 0, Column: 3})
+	newLeaf1 := NewLeafNode(Symbol(3), true, 4, 7, Point{Row: 0, Column: 4}, Point{Row: 0, Column: 7})
+	newLeaf2 := NewLeafNode(Symbol(2), true, 8, 11, Point{Row: 0, Column: 8}, Point{Row: 0, Column: 11})
+	newRoot := NewParentNode(Symbol(4), true, []*Node{newLeaf0, newLeaf1, newLeaf2}, nil, 0)
+	newTree := NewTree(newRoot, []byte("abc expr 123"), lang)
+
+	ranges := DiffChangedRanges(oldTree, newTree)
+	if len(ranges) != 1 {
+		t.Fatalf("structure change: got %d ranges, want 1", len(ranges))
+	}
+	// The changed range should cover the union of old (0-11 after edit) and new (0-11)
+	if ranges[0].StartByte != 0 || ranges[0].EndByte != 11 {
+		t.Fatalf("structure change range: got %d-%d, want 0-11", ranges[0].StartByte, ranges[0].EndByte)
+	}
+}
+
+func TestDiffChangedRangesSymbolChanged(t *testing.T) {
+	lang := testLanguage()
+
+	// Old tree: program -> [identifier(0-3)]
+	oldLeaf := NewLeafNode(Symbol(1), true, 0, 3, Point{Row: 0, Column: 0}, Point{Row: 0, Column: 3})
+	oldLeaf.dirty = true // simulate edit marking
+	oldRoot := NewParentNode(Symbol(4), true, []*Node{oldLeaf}, nil, 0)
+	oldRoot.dirty = true
+	oldTree := NewTree(oldRoot, []byte("abc"), lang)
+
+	// New tree: program -> [number(0-3)] — same position, different symbol
+	newLeaf := NewLeafNode(Symbol(2), true, 0, 3, Point{Row: 0, Column: 0}, Point{Row: 0, Column: 3})
+	newRoot := NewParentNode(Symbol(4), true, []*Node{newLeaf}, nil, 0)
+	newTree := NewTree(newRoot, []byte("123"), lang)
+
+	ranges := DiffChangedRanges(oldTree, newTree)
+	if len(ranges) != 1 {
+		t.Fatalf("symbol change: got %d ranges, want 1", len(ranges))
+	}
+	if ranges[0].StartByte != 0 || ranges[0].EndByte != 3 {
+		t.Fatalf("symbol change range: got %d-%d, want 0-3", ranges[0].StartByte, ranges[0].EndByte)
+	}
+}
+
+func TestDiffChangedRangesNilTrees(t *testing.T) {
+	lang := testLanguage()
+	leaf := NewLeafNode(Symbol(1), true, 0, 3, Point{Row: 0, Column: 0}, Point{Row: 0, Column: 3})
+	root := NewParentNode(Symbol(4), true, []*Node{leaf}, nil, 0)
+	tree := NewTree(root, []byte("abc"), lang)
+
+	if ranges := DiffChangedRanges(nil, tree); ranges != nil {
+		t.Fatal("nil oldTree: expected nil result")
+	}
+	if ranges := DiffChangedRanges(tree, nil); ranges != nil {
+		t.Fatal("nil newTree: expected nil result")
+	}
+	if ranges := DiffChangedRanges(nil, nil); ranges != nil {
+		t.Fatal("both nil: expected nil result")
+	}
+
+	// Tree with nil root
+	emptyTree := NewTree(nil, nil, lang)
+	if ranges := DiffChangedRanges(emptyTree, tree); ranges != nil {
+		t.Fatal("nil root in oldTree: expected nil result")
+	}
+	if ranges := DiffChangedRanges(tree, emptyTree); ranges != nil {
+		t.Fatal("nil root in newTree: expected nil result")
+	}
+}
+
+func TestDiffChangedRangesMultipleChanges(t *testing.T) {
+	lang := testLanguage()
+
+	// Old tree: program -> [identifier(0-3), number(4-7), identifier(8-11)]
+	oldLeaf0 := NewLeafNode(Symbol(1), true, 0, 3, Point{Row: 0, Column: 0}, Point{Row: 0, Column: 3})
+	oldLeaf1 := NewLeafNode(Symbol(2), true, 4, 7, Point{Row: 0, Column: 4}, Point{Row: 0, Column: 7})
+	oldLeaf2 := NewLeafNode(Symbol(1), true, 8, 11, Point{Row: 0, Column: 8}, Point{Row: 0, Column: 11})
+	oldRoot := NewParentNode(Symbol(4), true, []*Node{oldLeaf0, oldLeaf1, oldLeaf2}, nil, 0)
+	oldTree := NewTree(oldRoot, []byte("abc 123 def"), lang)
+
+	// Mark first and third children as dirty (simulating edits to non-adjacent ranges)
+	oldLeaf0.dirty = true
+	oldLeaf2.dirty = true
+	oldRoot.dirty = true
+
+	// New tree: first and third leaves have different byte ranges
+	newLeaf0 := NewLeafNode(Symbol(1), true, 0, 4, Point{Row: 0, Column: 0}, Point{Row: 0, Column: 4})
+	newLeaf1 := NewLeafNode(Symbol(2), true, 5, 8, Point{Row: 0, Column: 5}, Point{Row: 0, Column: 8})
+	newLeaf2 := NewLeafNode(Symbol(1), true, 9, 13, Point{Row: 0, Column: 9}, Point{Row: 0, Column: 13})
+	newRoot := NewParentNode(Symbol(4), true, []*Node{newLeaf0, newLeaf1, newLeaf2}, nil, 0)
+	newTree := NewTree(newRoot, []byte("abcd 123 defg"), lang)
+
+	ranges := DiffChangedRanges(oldTree, newTree)
+	// Expect changes for leaf0 (byte ranges differ) and leaf2 (byte ranges differ)
+	// leaf1 also differs (4-7 vs 5-8) since dirty propagates
+	// All three leaves differ in byte range, so we should get ranges for all three
+	// But coalescing may merge them. Let's verify we get at least the right coverage.
+	if len(ranges) == 0 {
+		t.Fatal("multiple changes: expected non-empty ranges")
+	}
+	// The first changed range should start at 0
+	if ranges[0].StartByte != 0 {
+		t.Fatalf("first range start: got %d, want 0", ranges[0].StartByte)
+	}
+	// The last changed range should end at 13
+	lastRange := ranges[len(ranges)-1]
+	if lastRange.EndByte != 13 {
+		t.Fatalf("last range end: got %d, want 13", lastRange.EndByte)
+	}
+}
+
+func TestDiffChangedRangesCoalescing(t *testing.T) {
+	lang := testLanguage()
+
+	// Two adjacent changed children should be coalesced into one range.
+	oldLeaf0 := NewLeafNode(Symbol(1), true, 0, 3, Point{Row: 0, Column: 0}, Point{Row: 0, Column: 3})
+	oldLeaf1 := NewLeafNode(Symbol(2), true, 3, 6, Point{Row: 0, Column: 3}, Point{Row: 0, Column: 6})
+	oldRoot := NewParentNode(Symbol(4), true, []*Node{oldLeaf0, oldLeaf1}, nil, 0)
+	oldLeaf0.dirty = true
+	oldLeaf1.dirty = true
+	oldRoot.dirty = true
+	oldTree := NewTree(oldRoot, []byte("abcdef"), lang)
+
+	// New tree: same structure but different byte ranges
+	newLeaf0 := NewLeafNode(Symbol(1), true, 0, 4, Point{Row: 0, Column: 0}, Point{Row: 0, Column: 4})
+	newLeaf1 := NewLeafNode(Symbol(2), true, 4, 8, Point{Row: 0, Column: 4}, Point{Row: 0, Column: 8})
+	newRoot := NewParentNode(Symbol(4), true, []*Node{newLeaf0, newLeaf1}, nil, 0)
+	newTree := NewTree(newRoot, []byte("abcdEFGH"), lang)
+
+	ranges := DiffChangedRanges(oldTree, newTree)
+	// Both leaf ranges touch/overlap (0-3/0-4 and 3-6/4-8), should coalesce to 1
+	if len(ranges) != 1 {
+		t.Fatalf("coalescing: got %d ranges, want 1", len(ranges))
+	}
+	if ranges[0].StartByte != 0 || ranges[0].EndByte != 8 {
+		t.Fatalf("coalesced range: got %d-%d, want 0-8", ranges[0].StartByte, ranges[0].EndByte)
+	}
+}
+
 func TestTreeChangedRanges(t *testing.T) {
 	lang := testLanguage()
 	root := NewLeafNode(Symbol(1), true, 0, 6, Point{}, Point{Row: 0, Column: 6})

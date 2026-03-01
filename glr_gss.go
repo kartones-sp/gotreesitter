@@ -21,6 +21,7 @@ type gssStack struct {
 type gssScratch struct {
 	slabs      []gssNodeSlab
 	slabCursor int
+	skipClear  bool
 }
 
 type gssNodeSlab struct {
@@ -30,8 +31,9 @@ type gssNodeSlab struct {
 
 const (
 	// 64-bit FNV-1a constants.
-	gssHashSeed  uint64 = 1469598103934665603
-	gssHashPrime uint64 = 1099511628211
+	gssHashSeed        uint64 = 1469598103934665603
+	gssHashPrime       uint64 = 1099511628211
+	gssNilNodeSentinel uint64 = 0xff51afd7ed558ccd
 )
 
 func gssEntryHash(prev uint64, entry stackEntry) uint64 {
@@ -40,7 +42,7 @@ func gssEntryHash(prev uint64, entry stackEntry) uint64 {
 
 	n := entry.node
 	if n == nil {
-		h ^= 0xff51afd7ed558ccd
+		h ^= gssNilNodeSentinel
 		h *= gssHashPrime
 		return h
 	}
@@ -163,6 +165,8 @@ func (s gssStack) materialize(dst []stackEntry) []stackEntry {
 		i--
 	}
 	if i >= 0 {
+		// Invariant violation: depth metadata does not match linked-list length.
+		// This indicates internal GSS corruption and is not recoverable here.
 		panic("gssStack.materialize: corrupt depth metadata")
 	}
 	return dst
@@ -215,6 +219,7 @@ func (s *gssScratch) allocNode(entry stackEntry, prev *gssNode, depth int) *gssN
 
 func (s *gssScratch) reset() {
 	if len(s.slabs) == 0 {
+		s.skipClear = false
 		return
 	}
 	total := 0
@@ -237,12 +242,21 @@ func (s *gssScratch) reset() {
 			s.slabs = s.slabs[:len(s.slabs)-keepFrom]
 		}
 	}
+	if s.skipClear {
+		for i := range s.slabs {
+			s.slabs[i].used = 0
+		}
+		s.slabCursor = 0
+		s.skipClear = false
+		return
+	}
 	for i := range s.slabs {
 		slab := &s.slabs[i]
 		clear(slab.data[:slab.used])
 		slab.used = 0
 	}
 	s.slabCursor = 0
+	s.skipClear = false
 }
 
 func (s *glrStack) toGSS(scratch *gssScratch) gssStack {
