@@ -14,6 +14,11 @@ type glrStack struct {
 	dead bool
 	// accepted is set when the stack reaches a ParseActionAccept.
 	accepted bool
+	// shifted is set when this stack consumed the current token via a SHIFT
+	// action. When other stacks in the same round performed a REDUCE
+	// (causing the token to be re-applied), shifted stacks must be skipped
+	// so they don't see the same token twice.
+	shifted bool
 }
 
 const (

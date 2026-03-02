@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"unicode/utf8"
 )
@@ -218,6 +219,9 @@ func (d *dfaTokenSource) Close() {
 
 // DebugDFA enables trace logging for DFA token production.
 var DebugDFA bool
+
+// DebugGLR enables trace logging for GLR stack operations.
+var DebugGLR bool
 
 func (d *dfaTokenSource) Next() Token {
 	if tok, ok := d.nextExternalToken(); ok {
@@ -841,6 +845,9 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 
 		if needToken {
 			tok = ts.Next()
+			for si := range stacks {
+				stacks[si].shifted = false
+			}
 		}
 
 		// Incremental parsing fast-path: when there is a single active stack,
@@ -859,15 +866,51 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 		// We iterate by index because forks may append to `stacks`.
 		numStacks := len(stacks)
 		anyReduced := false
+		var reLexTok *Token // set when a GLR re-lex succeeds; applied after the loop
+
+		// Pre-check: does the primary stack have an action for this token?
+		// Used to decide whether to kill it when a re-lex succeeds elsewhere.
+		primaryHasAction := false
+		if len(stacks) > 0 && !stacks[0].dead && !stacks[0].shifted {
+			if a := p.lookupAction(stacks[0].top().state, tok.Symbol); a != nil && len(a.Actions) > 0 {
+				primaryHasAction = true
+			} else if tok.Symbol != 0 {
+				// Also check alias resolution.
+				if alt := p.resolveTokenAlias(stacks[0].top().state, tok.Symbol); alt != tok.Symbol {
+					if a2 := p.lookupAction(stacks[0].top().state, alt); a2 != nil && len(a2.Actions) > 0 {
+						primaryHasAction = true
+					}
+				}
+			}
+		}
 
 		for si := 0; si < numStacks; si++ {
 			s := &stacks[si]
 			if s.dead {
 				continue
 			}
+			// Skip stacks that already consumed this token via SHIFT
+			// in a previous iteration (while other stacks were reducing).
+			if s.shifted {
+				if DebugGLR {
+					fmt.Fprintf(os.Stderr, "  GLR: skip stack[%d] state=%d (shifted)\n", si, s.top().state)
+				}
+				continue
+			}
 
 			currentState := s.top().state
 			action := p.lookupAction(currentState, tok.Symbol)
+			if DebugGLR {
+				nact := 0
+				if action != nil {
+					nact = len(action.Actions)
+				}
+				symName := ""
+				if int(tok.Symbol) < len(p.language.SymbolNames) {
+					symName = p.language.SymbolNames[tok.Symbol]
+				}
+				fmt.Fprintf(os.Stderr, "  GLR: stack[%d] state=%d tok=%d(%s) actions=%d\n", si, currentState, tok.Symbol, symName, nact)
+			}
 
 			// --- Symbol alias resolution ---
 			// When the same lexeme has multiple symbol IDs (e.g. '?' as
@@ -894,6 +937,58 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 				nodeCount++
 				needToken = true
 				continue
+			}
+
+			// --- GLR re-lex: alternate stacks may need different tokens ---
+			// The DFA produces tokens using the primary stack's lex mode.
+			// Non-primary stacks in different parser states may have a
+			// different lex mode. If no action was found and this stack's
+			// lex mode differs, re-lex from the current byte position.
+			// On success, promote this stack's token and mark other stacks
+			// that also had no action for the original token as needing
+			// the re-lexed token.
+			stackTok := tok
+			if (action == nil || len(action.Actions) == 0) && si > 0 && tok.Symbol != 0 {
+				if dts, ok := ts.(*dfaTokenSource); ok {
+					thisLex := p.language.LexModes[currentState].LexState
+					primaryLex := p.language.LexModes[stacks[0].top().state].LexState
+					if thisLex != primaryLex {
+						origState := dts.state
+						origPos := dts.lexer.pos
+						dts.state = currentState
+						dts.lexer.pos = int(tok.StartByte)
+						altTok := dts.Next()
+						dts.state = origState
+						matched := false
+						if altTok.Symbol != tok.Symbol && altTok.Symbol != 0 {
+							altAction := p.lookupAction(currentState, altTok.Symbol)
+							if altAction != nil && len(altAction.Actions) > 0 {
+								if DebugGLR {
+									altName := ""
+									if int(altTok.Symbol) < len(p.language.SymbolNames) {
+										altName = p.language.SymbolNames[altTok.Symbol]
+									}
+									fmt.Fprintf(os.Stderr, "  GLR: re-lex stack[%d] state=%d → tok=%d(%s)\n", si, currentState, altTok.Symbol, altName)
+								}
+								stackTok = altTok
+								action = altAction
+								matched = true
+								saved := altTok
+								reLexTok = &saved
+								// Kill the primary stack if it had no action
+								// for the original token — it only survived
+								// via grammar-directed recovery, which is the
+								// wrong path when this stack's re-lex succeeds.
+								if !primaryHasAction && !stacks[0].dead {
+									stacks[0].dead = true
+								}
+							}
+						}
+						if !matched {
+							dts.lexer.pos = origPos
+						}
+					}
+				}
 			}
 
 			// --- No action: error handling ---
@@ -934,7 +1029,27 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 				// that has a valid non-RECOVER action (SHIFT or REDUCE) for
 				// the current token. If found, pop to that depth, wrap
 				// discarded nodes in an ERROR parent, and retry the token.
-				if tokensOKSinceUnwind > 0 || lastUnwindByte < 0 {
+				//
+				// Exception: if the token is a contextual keyword (e.g.
+				// "from") lexed as identifier, skip it first and let the
+				// next (more specific) token drive the unwind. This avoids
+				// unwinding into a generic identifier context and losing
+				// the current rule structure (e.g. import context).
+				skipUnwind := false
+				if tok.Symbol == p.language.KeywordCaptureToken &&
+					tok.EndByte > tok.StartByte &&
+					int64(tok.StartByte) != lastUnwindByte {
+					start := int(tok.StartByte)
+					end := int(tok.EndByte)
+					if start >= 0 && end <= len(source) {
+						kw := NewLexer(p.language.KeywordLexStates, source[start:end])
+						kwTok := kw.Next(0)
+						if kwTok.Symbol != 0 && kwTok.EndByte == uint32(end-start) {
+							skipUnwind = true
+						}
+					}
+				}
+				if !skipUnwind && (tokensOKSinceUnwind > 0 || lastUnwindByte < 0) {
 					if len(s.entries) > 1 {
 						if unwindDepth, ok := p.findUnwindTarget(s, tok.Symbol); ok {
 							var errChildren []*Node
@@ -984,24 +1099,36 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 			// For multi-action entries, clone the stack for each alternative.
 			// A successful action means the parser is making progress;
 			// count tokens with valid actions since last unwind.
-			if lastUnwindByte >= 0 && int64(tok.StartByte) > lastUnwindByte {
+			if lastUnwindByte >= 0 && int64(stackTok.StartByte) > lastUnwindByte {
 				tokensOKSinceUnwind++
 			}
 			actions := action.Actions
 			if len(actions) > 1 {
+				if DebugGLR {
+					for ai, a := range actions {
+						fmt.Fprintf(os.Stderr, "  GLR: fork[%d] type=%d sym=%d state=%d children=%d\n", ai, a.Type, a.Symbol, a.State, a.ChildCount)
+					}
+				}
 				// Save state before applying any action.
 				saved := s.cloneWithScratch(&scratch.entries)
 				// Apply first action to the original stack.
-				p.applyAction(s, actions[0], tok, &anyReduced, &nodeCount, arena, &scratch.entries)
+				p.applyAction(s, actions[0], stackTok, &anyReduced, &nodeCount, arena, &scratch.entries)
 				// Clone for each additional action.
 				for ai := 1; ai < len(actions); ai++ {
 					fork := saved.cloneWithScratch(&scratch.entries)
-					p.applyAction(&fork, actions[ai], tok, &anyReduced, &nodeCount, arena, &scratch.entries)
+					p.applyAction(&fork, actions[ai], stackTok, &anyReduced, &nodeCount, arena, &scratch.entries)
 					stacks = append(stacks, fork)
 				}
 			} else {
-				p.applyAction(s, actions[0], tok, &anyReduced, &nodeCount, arena, &scratch.entries)
+				p.applyAction(s, actions[0], stackTok, &anyReduced, &nodeCount, arena, &scratch.entries)
 			}
+		}
+
+		// If a GLR re-lex produced a different token for a surviving stack,
+		// adopt it as the shared token so subsequent re-try iterations use
+		// the correct symbol (e.g. "=>" instead of "=").
+		if reLexTok != nil {
+			tok = *reLexTok
 		}
 
 		// After processing all stacks: determine whether to advance the
@@ -1052,6 +1179,7 @@ func (p *Parser) applyAction(s *glrStack, act ParseAction, tok Token, anyReduced
 		leaf.isExtra = act.Extra
 		leaf.parseState = act.State
 		s.push(act.State, leaf, entryScratch)
+		s.shifted = true
 		*nodeCount++
 
 	case ParseActionReduce:
