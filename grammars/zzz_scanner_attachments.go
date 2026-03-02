@@ -88,7 +88,7 @@ func init() {
 		"templ":          TemplExternalScanner{},
 		"org":            OrgExternalScanner{},
 		"odin":           OdinExternalScanner{},
-		// "tsx": TsxExternalScanner{}, // disabled: symbol IDs mismatch after blob regen; synthetic scanner handles ASI correctly
+		"tsx": TsxExternalScanner{},
 		"d":              DExternalScanner{},
 		"nickel":         NickelExternalScanner{},
 		"pug":            PugExternalScanner{},
