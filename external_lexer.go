@@ -61,8 +61,6 @@ func (l *ExternalLexer) Advance(skip bool) {
 	if skip {
 		l.startPos = l.pos
 		l.startPoint = l.point
-		l.endPos = l.pos
-		l.endPoint = l.point
 	}
 }
 
@@ -87,16 +85,23 @@ func (l *ExternalLexer) token() (Token, bool) {
 	if !l.hasResult {
 		return Token{}, false
 	}
-	if l.endPos < l.startPos {
-		return Token{}, false
+	// When the scanner advance(skip)-ed past the mark_end position,
+	// produce a zero-width token at the mark_end position. This
+	// matches C tree-sitter behavior where skip doesn't affect the
+	// token boundaries set by mark_end.
+	startPos := l.startPos
+	startPoint := l.startPoint
+	if startPos > l.endPos {
+		startPos = l.endPos
+		startPoint = l.endPoint
 	}
 
 	return Token{
 		Symbol:     l.resultSymbol,
-		Text:       bytesToStringNoCopy(l.source[l.startPos:l.endPos]),
-		StartByte:  uint32(l.startPos),
+		Text:       bytesToStringNoCopy(l.source[startPos:l.endPos]),
+		StartByte:  uint32(startPos),
 		EndByte:    uint32(l.endPos),
-		StartPoint: l.startPoint,
+		StartPoint: startPoint,
 		EndPoint:   l.endPoint,
 	}, true
 }
