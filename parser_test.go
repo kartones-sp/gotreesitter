@@ -258,6 +258,55 @@ func buildArithmeticRecoverLanguage() *Language {
 	}
 }
 
+func buildKeywordStateLanguageDense() *Language {
+	return &Language{
+		Name:                "keyword_state_dense",
+		SymbolCount:         4,
+		TokenCount:          3,
+		StateCount:          3,
+		LargeStateCount:     3,
+		KeywordCaptureToken: 1, // identifier
+		KeywordLexStates: []LexState{
+			{AcceptToken: 0},
+			{AcceptToken: 1}, // capture token
+			{AcceptToken: 2}, // keyword token
+		},
+		// columns: EOF(0), IDENT(1), KW_IF(2), stmt(3)
+		ParseTable: [][]uint16{
+			{0, 3, 4, 0}, // state 0: keyword allowed
+			{0, 3, 0, 0}, // state 1: identifier-only
+			{0, 0, 4, 0}, // state 2: keyword-only
+		},
+	}
+}
+
+func buildKeywordStateLanguageSmall() *Language {
+	return &Language{
+		Name:                "keyword_state_small",
+		SymbolCount:         4,
+		TokenCount:          3,
+		StateCount:          2,
+		LargeStateCount:     1,
+		KeywordCaptureToken: 1, // identifier
+		KeywordLexStates: []LexState{
+			{AcceptToken: 0},
+			{AcceptToken: 2}, // keyword token
+		},
+		// state 0 dense row: no keyword actions
+		ParseTable: [][]uint16{
+			{0, 3, 0, 0},
+		},
+		// state 1 uses small table and allows KW_IF (symbol 2).
+		SmallParseTableMap: []uint32{0},
+		SmallParseTable: []uint16{
+			1, // group count
+			4, // section action index
+			1, // symbol count
+			2, // KW_IF symbol
+		},
+	}
+}
+
 func TestNewParser(t *testing.T) {
 	lang := buildArithmeticLanguage()
 	parser := NewParser(lang)
@@ -512,14 +561,94 @@ func TestParserRecoverAction(t *testing.T) {
 	}
 }
 
+func TestBuildStateRecoverTableNilWhenNoRecoverActions(t *testing.T) {
+	lang := buildArithmeticLanguage()
+	table := buildStateRecoverTable(lang)
+	if table != nil {
+		t.Fatalf("expected nil recover table when grammar has no recover actions, got len=%d", len(table))
+	}
+}
+
+func TestBuildStateRecoverTableMarksRecoverStates(t *testing.T) {
+	lang := buildArithmeticRecoverLanguage()
+	table := buildStateRecoverTable(lang)
+	if len(table) == 0 {
+		t.Fatal("expected recover table to be populated")
+	}
+	if len(table) != int(lang.StateCount) {
+		t.Fatalf("recover table len = %d, want %d", len(table), lang.StateCount)
+	}
+	if table[0] {
+		t.Fatal("state 0 should not be marked recoverable")
+	}
+	if !table[2] {
+		t.Fatal("state 2 should be marked recoverable")
+	}
+}
+
+func TestBuildKeywordStatesDense(t *testing.T) {
+	lang := buildKeywordStateLanguageDense()
+	table := buildKeywordStates(lang)
+	if len(table) != int(lang.StateCount) {
+		t.Fatalf("keyword state table len = %d, want %d", len(table), lang.StateCount)
+	}
+	if !table[0] {
+		t.Fatal("state 0 should allow keyword promotion")
+	}
+	if table[1] {
+		t.Fatal("state 1 should not allow keyword promotion")
+	}
+	if !table[2] {
+		t.Fatal("state 2 should allow keyword promotion")
+	}
+}
+
+func TestBuildKeywordStatesSmall(t *testing.T) {
+	lang := buildKeywordStateLanguageSmall()
+	table := buildKeywordStates(lang)
+	if len(table) != int(lang.StateCount) {
+		t.Fatalf("keyword state table len = %d, want %d", len(table), lang.StateCount)
+	}
+	if table[0] {
+		t.Fatal("state 0 should not allow keyword promotion")
+	}
+	if !table[1] {
+		t.Fatal("state 1 should allow keyword promotion from small parse table")
+	}
+}
+
+func TestBuildKeywordStatesNilWhenNoKeywordActions(t *testing.T) {
+	lang := buildKeywordStateLanguageDense()
+	lang.ParseTable[0][2] = 0
+	lang.ParseTable[2][2] = 0
+	table := buildKeywordStates(lang)
+	if table != nil {
+		t.Fatalf("expected nil keyword state table, got len=%d", len(table))
+	}
+}
+
+func TestBuildRecoverActionsByStateMarksRecoverSymbols(t *testing.T) {
+	lang := buildArithmeticRecoverLanguage()
+	_, _, symbols := buildRecoverActionsByState(lang)
+	if len(symbols) == 0 {
+		t.Fatal("expected recover symbol table to be populated")
+	}
+	if !symbols[3] { // STAR
+		t.Fatal("expected STAR to be marked as recoverable lookahead")
+	}
+	if symbols[1] { // NUMBER
+		t.Fatal("did not expect NUMBER to be marked as recoverable lookahead")
+	}
+}
+
 func TestFindRecoverActionOnStackUsesNearestAncestor(t *testing.T) {
 	lang := buildArithmeticRecoverLanguage()
 	parser := NewParser(lang)
 	s := newGLRStack(lang.InitialState)
-	s.entries = append(s.entries, stackEntry{state: 2, node: nil})
-	s.entries = append(s.entries, stackEntry{state: 3, node: nil})
+	s.push(2, nil, nil, nil)
+	s.push(3, nil, nil, nil)
 
-	depth, act, ok := parser.findRecoverActionOnStack(&s, Symbol(3)) // STAR
+	depth, act, ok := parser.findRecoverActionOnStack(&s, Symbol(3), nil) // STAR
 	if !ok {
 		t.Fatal("expected recover action on stack for STAR")
 	}
@@ -531,6 +660,18 @@ func TestFindRecoverActionOnStackUsesNearestAncestor(t *testing.T) {
 	}
 	if act.State != 3 {
 		t.Fatalf("recover state = %d, want 3", act.State)
+	}
+}
+
+func TestRecoverActionForStateUsesSymbolSpecificTable(t *testing.T) {
+	lang := buildArithmeticRecoverLanguage()
+	parser := NewParser(lang)
+
+	if _, ok := parser.recoverActionForState(2, Symbol(3)); !ok {
+		t.Fatal("expected recover action for state 2 on STAR")
+	}
+	if _, ok := parser.recoverActionForState(2, Symbol(1)); ok {
+		t.Fatal("did not expect recover action for state 2 on NUMBER")
 	}
 }
 
@@ -604,6 +745,59 @@ func TestParserFieldMapFieldNames(t *testing.T) {
 	}
 }
 
+func TestBuildResultFoldExtrasPreservesFieldMappings(t *testing.T) {
+	lang := buildArithmeticLanguage()
+	lang.FieldCount = 1
+	lang.FieldNames = []string{"", "value"}
+	parser := NewParser(lang)
+
+	source := []byte(" 42 ")
+
+	leadingExtra := NewLeafNode(2, false, 0, 1, Point{Row: 0, Column: 0}, Point{Row: 0, Column: 1})
+	leadingExtra.isExtra = true
+
+	valueChild := NewLeafNode(1, true, 1, 3, Point{Row: 0, Column: 1}, Point{Row: 0, Column: 3})
+	realRoot := NewParentNode(3, true, []*Node{valueChild}, []FieldID{1}, 0)
+
+	trailingExtra := NewLeafNode(2, false, 3, 4, Point{Row: 0, Column: 3}, Point{Row: 0, Column: 4})
+	trailingExtra.isExtra = true
+
+	stack := []stackEntry{
+		{state: 0, node: leadingExtra},
+		{state: 0, node: realRoot},
+		{state: 0, node: trailingExtra},
+	}
+
+	tree := parser.buildResult(stack, source, nil, nil, nil, nil)
+	if tree == nil || tree.RootNode() == nil {
+		t.Fatal("buildResult returned nil tree/root")
+	}
+	root := tree.RootNode()
+	if root != realRoot {
+		t.Fatal("expected folded result to reuse real root node")
+	}
+	if root.ChildCount() != 3 {
+		t.Fatalf("root child count = %d, want 3", root.ChildCount())
+	}
+	if root.Child(0) != leadingExtra || root.Child(1) != valueChild || root.Child(2) != trailingExtra {
+		t.Fatalf("unexpected child order after folding extras")
+	}
+
+	fieldChild := root.ChildByFieldName("value", lang)
+	if fieldChild == nil {
+		t.Fatal("expected field-mapped child by name \"value\"")
+	}
+	if fieldChild != valueChild {
+		t.Fatal("field mapping shifted after folding extras")
+	}
+	if len(root.fieldIDs) != 3 || root.fieldIDs[1] != 1 {
+		t.Fatalf("fieldIDs not re-aligned after folding extras: %#v", root.fieldIDs)
+	}
+	if leadingExtra.Parent() != root || trailingExtra.Parent() != root {
+		t.Fatal("extra child parent pointers were not updated during fold")
+	}
+}
+
 func TestParserMultiDigitNumbers(t *testing.T) {
 	lang := buildArithmeticLanguage()
 	parser := NewParser(lang)
@@ -628,6 +822,55 @@ func TestParserMultiDigitNumbers(t *testing.T) {
 	if root.Child(2).Text(tree.Source()) != "456" {
 		t.Errorf("second NUMBER text = %q, want %q", root.Child(2).Text(tree.Source()), "456")
 	}
+}
+
+func TestNodesFromGSSFiltersNilAndPreservesOrder(t *testing.T) {
+	var scratch gssScratch
+	n1 := NewLeafNode(1, true, 0, 1, Point{Row: 0, Column: 0}, Point{Row: 0, Column: 1})
+	n2 := NewLeafNode(1, true, 2, 3, Point{Row: 0, Column: 2}, Point{Row: 0, Column: 3})
+
+	var s gssStack
+	s.push(1, nil, &scratch)
+	s.push(2, n1, &scratch)
+	s.push(3, nil, &scratch)
+	s.push(4, n2, &scratch)
+
+	nodes := nodesFromGSS(s)
+	if len(nodes) != 2 {
+		t.Fatalf("nodesFromGSS len = %d, want 2", len(nodes))
+	}
+	if nodes[0] != n1 || nodes[1] != n2 {
+		t.Fatalf("nodesFromGSS order mismatch: got [%p %p], want [%p %p]", nodes[0], nodes[1], n1, n2)
+	}
+}
+
+func TestBuildResultFromGLRWithGSSOnlyStack(t *testing.T) {
+	lang := buildArithmeticLanguage()
+	parser := NewParser(lang)
+	source := []byte("1")
+	arena := acquireNodeArena(arenaClassFull)
+
+	leaf := newLeafNodeInArena(arena, 1, true, 0, 1, Point{Row: 0, Column: 0}, Point{Row: 0, Column: 1})
+	leaf.parseState = 1
+	expr := newParentNodeInArena(arena, 3, true, []*Node{leaf}, nil, 0)
+	expr.parseState = 2
+
+	var gScratch gssScratch
+	gss := newGSSStack(lang.InitialState, &gScratch)
+	gss.push(expr.parseState, expr, &gScratch)
+	stack := glrStack{gss: gss}
+
+	tree := parser.buildResultFromGLR([]glrStack{stack}, source, arena, nil, nil, nil)
+	if tree == nil || tree.RootNode() == nil {
+		t.Fatal("buildResultFromGLR returned nil tree/root")
+	}
+	if tree.RootNode() != expr {
+		t.Fatal("expected GSS-only stack result to reuse the GSS node as root")
+	}
+	if got := tree.RootNode().Text(tree.Source()); got != "1" {
+		t.Fatalf("root text = %q, want %q", got, "1")
+	}
+	tree.Release()
 }
 
 func TestParserLongChain(t *testing.T) {
@@ -887,5 +1130,358 @@ func TestParserExternalScannerToken(t *testing.T) {
 	}
 	if got := root.Child(1).Text(tree.Source()); got != "#" {
 		t.Fatalf("operator text = %q, want %q", got, "#")
+	}
+}
+
+// TestFieldIDsAlignAfterExtrasFold verifies that when buildResult folds
+// extra nodes (e.g. leading comments) into a root's children, the fieldIDs
+// slice is padded to maintain index alignment with children.
+//
+// Regression test for: prepending extras into realRoot.children without
+// updating fieldIDs caused ChildByFieldName to return wrong nodes.
+func TestFieldIDsAlignAfterExtrasFold(t *testing.T) {
+	lang := queryTestLanguage()
+
+	// Construct a parent with fielded children:
+	//   children:  [ident,        paramList,       block]
+	//   fieldIDs:  [name(1),      parameters(5),   body(2)]
+	ident := NewLeafNode(Symbol(1), true, 5, 9, Point{}, Point{})
+	paramList := NewLeafNode(Symbol(13), true, 9, 11, Point{}, Point{})
+	block := NewLeafNode(Symbol(14), true, 12, 20, Point{}, Point{})
+	root := NewParentNode(Symbol(5), true,
+		[]*Node{ident, paramList, block},
+		[]FieldID{1, 5, 2}, 0)
+
+	// Sanity: field lookups work before modification.
+	if got := root.ChildByFieldName("name", lang); got != ident {
+		t.Fatal("pre-check: name field should return ident")
+	}
+	if got := root.ChildByFieldName("body", lang); got != block {
+		t.Fatal("pre-check: body field should return block")
+	}
+
+	// Simulate what buildResult's extras fold does: prepend a leading extra.
+	extra := NewLeafNode(Symbol(0), false, 0, 3, Point{}, Point{})
+	extra.isExtra = true
+
+	leadingCount := 1
+	merged := make([]*Node, 0, 1+len(root.children))
+	merged = append(merged, extra)
+	merged = append(merged, root.children...)
+	root.children = merged
+
+	// Pad fieldIDs to match: extras get 0.
+	if len(root.fieldIDs) > 0 {
+		padded := make([]FieldID, leadingCount+len(root.fieldIDs))
+		copy(padded[leadingCount:], root.fieldIDs)
+		root.fieldIDs = padded
+	}
+
+	// Verify field lookups still return correct nodes.
+	if got := root.ChildByFieldName("name", lang); got != ident {
+		t.Fatalf("after fold: name field should return ident (sym 1), got sym %d", got.Symbol())
+	}
+	if got := root.ChildByFieldName("body", lang); got != block {
+		t.Fatalf("after fold: body field should return block (sym 14), got sym %d", got.Symbol())
+	}
+	if got := root.ChildByFieldName("parameters", lang); got != paramList {
+		t.Fatalf("after fold: parameters field should return paramList (sym 13), got sym %d", got.Symbol())
+	}
+}
+
+func TestParserIncrementalArithmeticEditMatchesFreshParse(t *testing.T) {
+	lang := buildArithmeticLanguage()
+	parser := NewParser(lang)
+
+	oldSrc := []byte("1+2")
+	oldTree := mustParse(t, parser, oldSrc)
+
+	newSrc := []byte("1+3")
+	edit := InputEdit{
+		StartByte:   2,
+		OldEndByte:  3,
+		NewEndByte:  3,
+		StartPoint:  Point{Row: 0, Column: 2},
+		OldEndPoint: Point{Row: 0, Column: 3},
+		NewEndPoint: Point{Row: 0, Column: 3},
+	}
+	oldTree.Edit(edit)
+
+	incrTree := mustParseIncremental(t, parser, newSrc, oldTree)
+	freshTree := mustParse(t, parser, newSrc)
+
+	incrRoot := incrTree.RootNode()
+	freshRoot := freshTree.RootNode()
+	if incrRoot == nil || freshRoot == nil {
+		t.Fatal("expected non-nil roots")
+	}
+	if got, want := incrRoot.SExpr(lang), freshRoot.SExpr(lang); got != want {
+		t.Fatalf("incremental SExpr mismatch:\n  got:  %s\n  want: %s", got, want)
+	}
+	if incrRoot.HasError() != freshRoot.HasError() {
+		t.Fatalf("incremental HasError=%v, fresh HasError=%v", incrRoot.HasError(), freshRoot.HasError())
+	}
+}
+
+func TestParserIncrementalArithmeticEditThenUndoMatchesFreshParse(t *testing.T) {
+	lang := buildArithmeticLanguage()
+	parser := NewParser(lang)
+
+	originalSrc := []byte("1+2")
+	tree := mustParse(t, parser, originalSrc)
+
+	editedSrc := []byte("1+9")
+	forwardEdit := InputEdit{
+		StartByte:   2,
+		OldEndByte:  3,
+		NewEndByte:  3,
+		StartPoint:  Point{Row: 0, Column: 2},
+		OldEndPoint: Point{Row: 0, Column: 3},
+		NewEndPoint: Point{Row: 0, Column: 3},
+	}
+	tree.Edit(forwardEdit)
+	tree = mustParseIncremental(t, parser, editedSrc, tree)
+
+	undoEdit := InputEdit{
+		StartByte:   2,
+		OldEndByte:  3,
+		NewEndByte:  3,
+		StartPoint:  Point{Row: 0, Column: 2},
+		OldEndPoint: Point{Row: 0, Column: 3},
+		NewEndPoint: Point{Row: 0, Column: 3},
+	}
+	tree.Edit(undoEdit)
+	incrUndo := mustParseIncremental(t, parser, originalSrc, tree)
+	freshUndo := mustParse(t, parser, originalSrc)
+
+	incrRoot := incrUndo.RootNode()
+	freshRoot := freshUndo.RootNode()
+	if incrRoot == nil || freshRoot == nil {
+		t.Fatal("expected non-nil roots")
+	}
+	if got, want := incrRoot.SExpr(lang), freshRoot.SExpr(lang); got != want {
+		t.Fatalf("incremental undo SExpr mismatch:\n  got:  %s\n  want: %s", got, want)
+	}
+}
+
+func TestParseRuntimeReportsAcceptedOnCompleteParse(t *testing.T) {
+	lang := buildArithmeticLanguage()
+	parser := NewParser(lang)
+
+	tree := mustParse(t, parser, []byte("1+2"))
+	rt := tree.ParseRuntime()
+
+	if rt.StopReason != ParseStopAccepted {
+		t.Fatalf("StopReason = %q, want %q", rt.StopReason, ParseStopAccepted)
+	}
+	if tree.ParseStoppedEarly() {
+		t.Fatal("ParseStoppedEarly() = true, want false")
+	}
+	if rt.TokenSourceEOFEarly {
+		t.Fatal("TokenSourceEOFEarly = true, want false")
+	}
+	if rt.Truncated {
+		t.Fatal("Truncated = true, want false")
+	}
+	if rt.IterationLimit <= 0 {
+		t.Fatalf("IterationLimit = %d, want > 0", rt.IterationLimit)
+	}
+	if rt.StackDepthLimit <= 0 {
+		t.Fatalf("StackDepthLimit = %d, want > 0", rt.StackDepthLimit)
+	}
+	if rt.NodeLimit <= 0 {
+		t.Fatalf("NodeLimit = %d, want > 0", rt.NodeLimit)
+	}
+	if rt.Iterations <= 0 {
+		t.Fatalf("Iterations = %d, want > 0", rt.Iterations)
+	}
+}
+
+type eofAtZeroTokenSource struct{}
+
+func (eofAtZeroTokenSource) Next() Token {
+	return Token{
+		Symbol:    0,
+		StartByte: 0,
+		EndByte:   0,
+	}
+}
+
+func TestParseRuntimeReportsTokenSourceEOFEarly(t *testing.T) {
+	lang := buildArithmeticLanguage()
+	parser := NewParser(lang)
+	src := []byte("1+2")
+
+	tree, err := parser.ParseWithTokenSource(src, eofAtZeroTokenSource{})
+	if err != nil {
+		t.Fatalf("ParseWithTokenSource() error = %v", err)
+	}
+	rt := tree.ParseRuntime()
+
+	if rt.StopReason != ParseStopTokenSourceEOF {
+		t.Fatalf("StopReason = %q, want %q", rt.StopReason, ParseStopTokenSourceEOF)
+	}
+	if !rt.TokenSourceEOFEarly {
+		t.Fatal("TokenSourceEOFEarly = false, want true")
+	}
+	if rt.LastTokenEndByte != 0 {
+		t.Fatalf("LastTokenEndByte = %d, want 0", rt.LastTokenEndByte)
+	}
+	if !tree.ParseStoppedEarly() {
+		t.Fatal("ParseStoppedEarly() = false, want true")
+	}
+}
+
+// buildReservedWordLanguage constructs a minimal language to test reserved word
+// handling in promoteKeyword. Symbols:
+//   0: EOF
+//   1: IDENT (terminal, named) — keyword capture token
+//   2: KW_IF (terminal, anonymous) — keyword matched by DFA
+//   3: stmt (nonterminal, named)
+//
+// The keyword lexer DFA recognises "if" and emits symbol 2 (KW_IF).
+//
+// LexModes:
+//   state 0: no lex mode entry (unused)
+//   state 1: ReservedWordSetID=1 → set {KW_IF} → "if" is reserved, not promoted
+//   state 2: ReservedWordSetID=0 → no reserved words → "if" IS promoted
+//
+// ReservedWords layout (stride 2):
+//   set 0 (offset 0): [0, 0]       — empty
+//   set 1 (offset 2): [KW_IF, 0]   — KW_IF is reserved
+func buildReservedWordLanguage() *Language {
+	return &Language{
+		Name:                "reserved_word_test",
+		SymbolCount:         4,
+		TokenCount:          3,
+		StateCount:          3,
+		LargeStateCount:     3,
+		KeywordCaptureToken: 1, // IDENT
+		KeywordLexStates: []LexState{
+			// State 0: start — dispatch 'i'
+			{AcceptToken: 0, Default: -1, EOF: -1, Transitions: []LexTransition{
+				{Lo: 'i', Hi: 'i', NextState: 1},
+			}},
+			// State 1: saw 'i' — dispatch 'f'
+			{AcceptToken: 0, Default: -1, EOF: -1, Transitions: []LexTransition{
+				{Lo: 'f', Hi: 'f', NextState: 2},
+			}},
+			// State 2: saw "if" — accept KW_IF (symbol 2)
+			{AcceptToken: 2, Default: -1, EOF: -1},
+		},
+		LexModes: []LexMode{
+			{LexState: 0}, // state 0 — not used in test
+			{LexState: 0, ReservedWordSetID: 1}, // state 1 — KW_IF reserved
+			{LexState: 0, ReservedWordSetID: 0}, // state 2 — no reserved words
+		},
+		// Flat reserved word array, stride=2.
+		// Set 0 (offset 0..1): empty [0, 0]
+		// Set 1 (offset 2..3): [KW_IF(2), 0]
+		ReservedWords:          []Symbol{0, 0, 2, 0},
+		MaxReservedWordSetSize: 2,
+		// Dense parse table — both IDENT and KW_IF valid in all states
+		// so context-aware check doesn't interfere.
+		// Columns: EOF(0), IDENT(1), KW_IF(2), stmt(3)
+		ParseTable: [][]uint16{
+			{0, 1, 1, 0}, // state 0
+			{0, 1, 1, 0}, // state 1
+			{0, 1, 1, 0}, // state 2
+		},
+		ParseActions: []ParseActionEntry{
+			{Actions: nil},
+			{Actions: []ParseAction{{Type: ParseActionShift, State: 1}}},
+		},
+	}
+}
+
+func TestReservedWordBlocksPromotion(t *testing.T) {
+	lang := buildReservedWordLanguage()
+	source := []byte("if")
+
+	// Helper to build a dfaTokenSource with the given parse state and run
+	// promoteKeyword on a token matching the keyword capture token.
+	testPromote := func(state StateID) Token {
+		lx := &Lexer{
+			states: lang.LexStates,
+			source: source,
+		}
+		d := &dfaTokenSource{
+			lexer:    lx,
+			language: lang,
+			state:    state,
+		}
+		tok := Token{
+			Symbol:    lang.KeywordCaptureToken, // IDENT
+			StartByte: 0,
+			EndByte:   2,
+		}
+		return d.promoteKeyword(tok)
+	}
+
+	// State 1 has ReservedWordSetID=1 which contains KW_IF (symbol 2).
+	// "if" should NOT be promoted — token stays as IDENT (symbol 1).
+	got := testPromote(1)
+	if got.Symbol != 1 {
+		t.Fatalf("state 1 (reserved): got symbol %d, want 1 (IDENT — not promoted)", got.Symbol)
+	}
+
+	// State 2 has ReservedWordSetID=0 — no reserved words.
+	// "if" SHOULD be promoted to KW_IF (symbol 2).
+	got = testPromote(2)
+	if got.Symbol != 2 {
+		t.Fatalf("state 2 (not reserved): got symbol %d, want 2 (KW_IF — promoted)", got.Symbol)
+	}
+}
+
+func TestReservedWordNoReservedWordsArray(t *testing.T) {
+	// When ReservedWords is empty, promotion should proceed normally.
+	lang := buildReservedWordLanguage()
+	lang.ReservedWords = nil
+	lang.MaxReservedWordSetSize = 0
+	source := []byte("if")
+
+	lx := &Lexer{
+		states: lang.LexStates,
+		source: source,
+	}
+	d := &dfaTokenSource{
+		lexer:    lx,
+		language: lang,
+		state:    1, // would be reserved if array were present
+	}
+	tok := Token{
+		Symbol:    lang.KeywordCaptureToken,
+		StartByte: 0,
+		EndByte:   2,
+	}
+	got := d.promoteKeyword(tok)
+	if got.Symbol != 2 {
+		t.Fatalf("empty ReservedWords: got symbol %d, want 2 (KW_IF — promoted)", got.Symbol)
+	}
+}
+
+func TestReservedWordSetIDZeroDoesNotBlock(t *testing.T) {
+	// ReservedWordSetID=0 means no reserved words for this state,
+	// even if the ReservedWords array is populated.
+	lang := buildReservedWordLanguage()
+	source := []byte("if")
+
+	lx := &Lexer{
+		states: lang.LexStates,
+		source: source,
+	}
+	d := &dfaTokenSource{
+		lexer:    lx,
+		language: lang,
+		state:    2, // ReservedWordSetID=0
+	}
+	tok := Token{
+		Symbol:    lang.KeywordCaptureToken,
+		StartByte: 0,
+		EndByte:   2,
+	}
+	got := d.promoteKeyword(tok)
+	if got.Symbol != 2 {
+		t.Fatalf("setID=0: got symbol %d, want 2 (KW_IF — promoted)", got.Symbol)
 	}
 }

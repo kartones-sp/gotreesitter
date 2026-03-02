@@ -1,3 +1,7 @@
+// Package grammars provides 206 embedded tree-sitter grammars as compressed
+// binary blobs with lazy loading. Use AllLanguages to enumerate available
+// grammars, DetectLanguage to match by file extension or shebang, or call
+// individual language functions (e.g. GoLanguage()) for direct access.
 package grammars
 
 import (
@@ -66,14 +70,6 @@ func AllLanguages() []LangEntry {
 			continue
 		}
 		out[i].TagsQuery = inferredTagsQuery(out[i])
-	}
-	for i := range out {
-		if out[i].Quality != "" {
-			continue
-		}
-		lang := out[i].Language()
-		report := EvaluateParseSupport(out[i], lang)
-		out[i].Quality = qualityFromBackend(report.Backend)
 	}
 	return out
 }

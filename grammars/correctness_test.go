@@ -43,7 +43,7 @@ var correctnessGoldens = map[string]string{
 	"css":        "(stylesheet (rule_set (selectors (tag_name)) (block (declaration (property_name) (plain_value)))))",
 	"elixir":     "(source (call (identifier) (arguments (alias)) (do_block (call (identifier) (arguments (call (identifier) (arguments (identifier))) (keywords (pair (keyword) (identifier))))))))",
 	"go":         "(source_file (package_clause (package_identifier)) (function_declaration (identifier) (parameter_list) (block (statement_list (expression_statement (call_expression (identifier) (argument_list (int_literal))))))))",
-	"html":       "(document (element (start_tag (tag_name)) (element (start_tag (tag_name)) (text) (end_tag (tag_name))) (end_tag (tag_name))) (text))",
+	"html":       "(document (element (start_tag (tag_name)) (element (start_tag (tag_name)) (text) (end_tag (tag_name))) (end_tag (tag_name))))",
 	"java":       "(program (class_declaration (identifier) (class_body (field_declaration (integral_type) (variable_declarator (identifier))))))",
 	"javascript": "(program (function_declaration (identifier) (formal_parameters) (statement_block (return_statement (number)))) (lexical_declaration (variable_declarator (identifier) (arrow_function (formal_parameters) (binary_expression (identifier) (number))))))",
 	"json":       "(document (object (pair (string (string_content)) (number))))",
@@ -56,20 +56,15 @@ var correctnessGoldens = map[string]string{
 	"scala":      "(compilation_unit (object_definition (identifier) (template_body (function_definition (identifier) (parameters (parameter (identifier) (type_identifier))) (type_identifier) (infix_expression (identifier) (operator_identifier) (integer_literal))))))",
 	"toml":       "(document (pair (bare_key) (integer)) (pair (bare_key) (string)) (pair (bare_key) (array (string) (string))))",
 	"typescript": "(program (function_declaration (identifier) (formal_parameters) (type_annotation (predefined_type)) (statement_block (return_statement (number)))))",
-	"yaml":       "(stream (document (block_node (block_mapping (block_mapping_pair (flow_node (plain_scalar (string_scalar))) (flow_node (plain_scalar (integer_scalar))))))))",
+	"yaml":       "(stream (document (block_node (block_mapping (block_mapping_pair (flow_node (plain_scalar (string_scalar))) (flow_node (plain_scalar (string_scalar)))) (block_mapping_pair (flow_node (plain_scalar (string_scalar))) (block_node (block_mapping (block_mapping_pair (flow_node (plain_scalar (string_scalar))) (flow_node (plain_scalar (string_scalar)))))))))))",
 }
 
 func TestCorrectnessSnapshots(t *testing.T) {
 	entries := AllLanguages()
+	t.Cleanup(func() { PurgeEmbeddedLanguageCache() })
 	entryByName := make(map[string]LangEntry, len(entries))
 	for _, e := range entries {
 		entryByName[e.Name] = e
-	}
-
-	reports := AuditParseSupport()
-	reportByName := make(map[string]ParseSupport, len(reports))
-	for _, r := range reports {
-		reportByName[r.Name] = r
 	}
 
 	for name, golden := range correctnessGoldens {
@@ -78,9 +73,10 @@ func TestCorrectnessSnapshots(t *testing.T) {
 			if !ok {
 				t.Fatalf("language %q not registered", name)
 			}
-			report := reportByName[name]
-			sample := parseSmokeSample(name)
+			t.Cleanup(func() { UnloadEmbeddedLanguage(entry.Name + ".bin") })
 			lang := entry.Language()
+			report := EvaluateParseSupport(entry, lang)
+			sample := ParseSmokeSample(name)
 			parser := gotreesitter.NewParser(lang)
 			src := []byte(sample)
 
@@ -102,6 +98,7 @@ func TestCorrectnessSnapshots(t *testing.T) {
 			if tree == nil || tree.RootNode() == nil {
 				t.Fatal("parse returned nil root")
 			}
+			defer tree.Release()
 
 			got := sexpr(tree.RootNode(), lang)
 			if got != golden {

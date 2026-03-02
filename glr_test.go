@@ -32,23 +32,49 @@ func TestMergeStacksSameTopState(t *testing.T) {
 	}
 }
 
+func TestMergeStacksSameStateDifferentByteOffset(t *testing.T) {
+	s1 := newGLRStack(StateID(5))
+	s1.push(5, NewLeafNode(1, true, 0, 3, Point{}, Point{Column: 3}), nil, nil)
+
+	s2 := newGLRStack(StateID(5))
+	s2.push(5, NewLeafNode(1, true, 0, 7, Point{}, Point{Column: 7}), nil, nil)
+
+	result := mergeStacks([]glrStack{s1, s2})
+	if len(result) != 2 {
+		t.Fatalf("expected 2 stacks (distinct byte offsets), got %d", len(result))
+	}
+}
+
+func TestMergeStacksSameStateDifferentEntries(t *testing.T) {
+	s1 := newGLRStack(StateID(5))
+	s1.push(5, NewLeafNode(1, true, 0, 3, Point{}, Point{Column: 3}), nil, nil)
+
+	s2 := newGLRStack(StateID(5))
+	s2.push(5, NewLeafNode(2, true, 0, 3, Point{}, Point{Column: 3}), nil, nil)
+
+	result := mergeStacks([]glrStack{s1, s2})
+	if len(result) != 2 {
+		t.Fatalf("expected 2 stacks (distinct parse paths), got %d", len(result))
+	}
+}
+
 func TestGLRStackClone(t *testing.T) {
 	s := newGLRStack(StateID(1))
-	s.entries = append(s.entries, stackEntry{state: 2, node: nil})
+	s.push(2, nil, nil, nil)
 	s.score = 5
 
 	clone := s.clone()
-	clone.entries = append(clone.entries, stackEntry{state: 3, node: nil})
+	clone.push(3, nil, nil, nil)
 	clone.score = 10
 
-	if len(s.entries) != 2 {
-		t.Errorf("original entries modified: len=%d, want 2", len(s.entries))
+	if s.depth() != 2 {
+		t.Errorf("original entries modified: len=%d, want 2", s.depth())
 	}
 	if s.score != 5 {
 		t.Errorf("original score modified: %d, want 5", s.score)
 	}
-	if len(clone.entries) != 3 {
-		t.Errorf("clone entries wrong: len=%d, want 3", len(clone.entries))
+	if clone.depth() != 3 {
+		t.Errorf("clone entries wrong: len=%d, want 3", clone.depth())
 	}
 }
 
@@ -174,5 +200,254 @@ func TestGLRForkPicksHigherPrecedence(t *testing.T) {
 	if root.Symbol() != 3 {
 		t.Errorf("GLR should pick B (symbol 3, prec 5) but got symbol %d (%s)",
 			root.Symbol(), root.Type(lang))
+	}
+}
+
+func buildForkLanguage(precedences []int16, childCounts []uint8) *Language {
+	if len(precedences) == 0 {
+		panic("buildForkLanguage requires at least one reduce action")
+	}
+	if len(precedences) != len(childCounts) {
+		panic("buildForkLanguage precedence and childCount lengths must match")
+	}
+
+	symbolCount := 2 + len(precedences)
+	symbolNames := make([]string, symbolCount)
+	symbolMeta := make([]SymbolMetadata, symbolCount)
+	symbolNames[0] = "EOF"
+	symbolMeta[0] = SymbolMetadata{Name: "EOF"}
+	symbolNames[1] = "x"
+	symbolMeta[1] = SymbolMetadata{Name: "x", Visible: true, Named: true}
+	for i := range precedences {
+		name := string(rune('A' + i))
+		symbolNames[2+i] = name
+		symbolMeta[2+i] = SymbolMetadata{Name: name, Visible: true, Named: true}
+	}
+
+	multi := make([]ParseAction, 0, len(precedences))
+	for i, prec := range precedences {
+		multi = append(multi, ParseAction{
+			Type:              ParseActionReduce,
+			Symbol:            Symbol(2 + i),
+			ChildCount:        childCounts[i],
+			ProductionID:      uint16(i),
+			DynamicPrecedence: prec,
+		})
+	}
+
+	// Parse action table:
+	//   0: error/no-action
+	//   1: shift x -> state 1
+	//   2: multi-reduce fork entry
+	//   3..(3+n-1): goto actions for non-terminals -> state 2
+	//   acceptIdx: accept action
+	parseActions := make([]ParseActionEntry, 0, 4+len(precedences))
+	parseActions = append(parseActions, ParseActionEntry{Actions: nil})                                               // 0
+	parseActions = append(parseActions, ParseActionEntry{Actions: []ParseAction{{Type: ParseActionShift, State: 1}}}) // 1
+	parseActions = append(parseActions, ParseActionEntry{Actions: multi})                                             // 2
+	for range precedences {
+		parseActions = append(parseActions, ParseActionEntry{Actions: []ParseAction{{Type: ParseActionShift, State: 2}}})
+	}
+	acceptIdx := len(parseActions)
+	parseActions = append(parseActions, ParseActionEntry{Actions: []ParseAction{{Type: ParseActionAccept}}})
+
+	rowWidth := symbolCount
+	state0 := make([]uint16, rowWidth)
+	state0[1] = 1 // x -> shift
+	for i := range precedences {
+		state0[2+i] = uint16(3 + i) // goto for each non-terminal
+	}
+	state1 := make([]uint16, rowWidth)
+	state1[0] = 2 // EOF -> multi reduce
+	state1[1] = 2 // x   -> multi reduce
+	state2 := make([]uint16, rowWidth)
+	state2[0] = uint16(acceptIdx) // EOF -> accept
+	state3 := make([]uint16, rowWidth)
+
+	return &Language{
+		Name:               "fork_language",
+		SymbolCount:        uint32(symbolCount),
+		TokenCount:         2,
+		ExternalTokenCount: 0,
+		StateCount:         4,
+		LargeStateCount:    0,
+		FieldCount:         0,
+		ProductionIDCount:  uint32(len(precedences)),
+		SymbolNames:        symbolNames,
+		SymbolMetadata:     symbolMeta,
+		FieldNames:         []string{""},
+		ParseActions:       parseActions,
+		ParseTable:         [][]uint16{state0, state1, state2, state3},
+		LexModes:           []LexMode{{LexState: 0}, {LexState: 0}, {LexState: 0}, {LexState: 0}},
+		LexStates: []LexState{
+			{
+				AcceptToken: 0,
+				Skip:        false,
+				Default:     -1,
+				EOF:         -1,
+				Transitions: []LexTransition{
+					{Lo: 'x', Hi: 'x', NextState: 1},
+					{Lo: ' ', Hi: ' ', NextState: 2},
+				},
+			},
+			{
+				AcceptToken: 1,
+				Skip:        false,
+				Default:     -1,
+				EOF:         -1,
+			},
+			{
+				AcceptToken: 0,
+				Skip:        true,
+				Default:     -1,
+				EOF:         -1,
+			},
+		},
+	}
+}
+
+func TestGLRForkEqualPrecedenceTieKeepsFirstAction(t *testing.T) {
+	lang := buildForkLanguage([]int16{0, 0}, []uint8{1, 1})
+	parser := NewParser(lang)
+	tree := mustParse(t, parser, []byte("x"))
+	root := tree.RootNode()
+	if root == nil {
+		t.Fatal("tree has nil root")
+	}
+	if root.Symbol() != 2 {
+		t.Fatalf("equal-precedence tie should keep first reduce symbol 2, got %d (%s)", root.Symbol(), root.Type(lang))
+	}
+}
+
+func TestGLRForkHandlesThreeAlternatives(t *testing.T) {
+	lang := buildForkLanguage([]int16{0, 5, 3}, []uint8{1, 1, 1})
+	parser := NewParser(lang)
+	tree := mustParse(t, parser, []byte("x"))
+	root := tree.RootNode()
+	if root == nil {
+		t.Fatal("tree has nil root")
+	}
+	if root.Symbol() != 3 {
+		t.Fatalf("three-way fork should pick highest precedence symbol 3, got %d (%s)", root.Symbol(), root.Type(lang))
+	}
+}
+
+func TestGLRForkPrunesErroringAlternative(t *testing.T) {
+	lang := buildForkLanguage([]int16{10, 1}, []uint8{2, 1})
+	parser := NewParser(lang)
+	tree := mustParse(t, parser, []byte("x"))
+	root := tree.RootNode()
+	if root == nil {
+		t.Fatal("tree has nil root")
+	}
+	// First branch requires two non-extra children and should die.
+	if root.Symbol() != 3 {
+		t.Fatalf("error-pruned fork should keep surviving symbol 3, got %d (%s)", root.Symbol(), root.Type(lang))
+	}
+}
+
+// TestMergeKeyGroupsEquivalentStacks proves stackEquivalent(a,b)==true
+// implies mergeKeyForStack(a)==mergeKeyForStack(b). With coarse merge keys,
+// this ensures equivalent stacks are always deduped in the same bucket.
+func TestMergeKeyGroupsEquivalentStacks(t *testing.T) {
+	scratch := &gssScratch{}
+
+	// Helper to build a GSS-backed stack with known entries.
+	buildStack := func(entries []stackEntry) glrStack {
+		var s glrStack
+		s.gss = buildGSSStack(entries, scratch)
+		s.byteOffset = stackByteOffset(entries)
+		return s
+	}
+
+	// Case 1: identical entries → equivalent, same hash.
+	node1a := &Node{symbol: 10, startByte: 0, endByte: 5, parseState: 1, isNamed: true}
+	node1b := &Node{symbol: 10, startByte: 0, endByte: 5, parseState: 1, isNamed: true}
+	a := buildStack([]stackEntry{{state: 1}, {state: 2, node: node1a}})
+	b := buildStack([]stackEntry{{state: 1}, {state: 2, node: node1b}})
+
+	if !stackEquivalent(a, b) {
+		t.Fatal("case 1: expected equivalent stacks")
+	}
+	ka := mergeKeyForStack(a)
+	kb := mergeKeyForStack(b)
+	if ka != kb {
+		t.Fatalf("case 1: equivalent stacks have different merge keys: %+v vs %+v", ka, kb)
+	}
+
+	// Case 2: different symbol → not equivalent.
+	node2a := &Node{symbol: 10, startByte: 0, endByte: 5, parseState: 1}
+	node2b := &Node{symbol: 11, startByte: 0, endByte: 5, parseState: 1}
+	c := buildStack([]stackEntry{{state: 1}, {state: 2, node: node2a}})
+	d := buildStack([]stackEntry{{state: 1}, {state: 2, node: node2b}})
+	if stackEquivalent(c, d) {
+		t.Fatal("case 2: expected non-equivalent stacks")
+	}
+	kc := mergeKeyForStack(c)
+	kd := mergeKeyForStack(d)
+	if kc == kd {
+		t.Log("case 2: non-equivalent stacks share coarse merge key (expected collision)")
+	}
+
+	// Case 3: isMissing differs → not equivalent (hash includes isMissing).
+	node3a := &Node{symbol: 10, startByte: 0, endByte: 5, parseState: 1}
+	node3b := &Node{symbol: 10, startByte: 0, endByte: 5, parseState: 1, isMissing: true}
+	e := buildStack([]stackEntry{{state: 1}, {state: 2, node: node3a}})
+	f := buildStack([]stackEntry{{state: 1}, {state: 2, node: node3b}})
+	if stackEquivalent(e, f) {
+		t.Fatal("case 3: isMissing differs, stacks should not be equivalent")
+	}
+
+	// Case 4: nil nodes on both sides → equivalent, same hash.
+	g := buildStack([]stackEntry{{state: 1}, {state: 2}})
+	h := buildStack([]stackEntry{{state: 1}, {state: 2}})
+	if !stackEquivalent(g, h) {
+		t.Fatal("case 4: expected equivalent nil-node stacks")
+	}
+	kg := mergeKeyForStack(g)
+	kh := mergeKeyForStack(h)
+	if kg != kh {
+		t.Fatalf("case 4: equivalent nil-node stacks have different merge keys: %+v vs %+v", kg, kh)
+	}
+
+	// Case 5: with children — same children → equivalent.
+	child1 := &Node{symbol: 20, startByte: 0, endByte: 3}
+	child2 := &Node{symbol: 20, startByte: 0, endByte: 3}
+	node5a := &Node{symbol: 10, startByte: 0, endByte: 5, parseState: 1, children: []*Node{child1}}
+	node5b := &Node{symbol: 10, startByte: 0, endByte: 5, parseState: 1, children: []*Node{child2}}
+	i := buildStack([]stackEntry{{state: 1}, {state: 2, node: node5a}})
+	j := buildStack([]stackEntry{{state: 1}, {state: 2, node: node5b}})
+	if !stackEquivalent(i, j) {
+		t.Fatal("case 5: expected equivalent stacks with same children")
+	}
+	ki := mergeKeyForStack(i)
+	kj := mergeKeyForStack(j)
+	if ki != kj {
+		t.Fatalf("case 5: equivalent stacks with children have different merge keys: %+v vs %+v", ki, kj)
+	}
+
+	// Case 6: children differ in symbol → not equivalent (children check).
+	// Coarse key may collide; stackEquivalent must reject the mismatch.
+	child3 := &Node{symbol: 20, startByte: 0, endByte: 3}
+	child4 := &Node{symbol: 21, startByte: 0, endByte: 3}
+	node6a := &Node{symbol: 10, startByte: 0, endByte: 5, parseState: 1, children: []*Node{child3}}
+	node6b := &Node{symbol: 10, startByte: 0, endByte: 5, parseState: 1, children: []*Node{child4}}
+	k := buildStack([]stackEntry{{state: 1}, {state: 2, node: node6a}})
+	l := buildStack([]stackEntry{{state: 1}, {state: 2, node: node6b}})
+	if stackEquivalent(k, l) {
+		t.Fatal("case 6: expected non-equivalent stacks with different children")
+	}
+	// These may share the same coarse merge key; that's fine because
+	// stackEquivalent still rejects them.
+}
+
+func TestMergeStacksAllDeadReturnsEmpty(t *testing.T) {
+	s1 := newGLRStack(StateID(1))
+	s2 := newGLRStack(StateID(2))
+	s1.dead = true
+	s2.dead = true
+	merged := mergeStacks([]glrStack{s1, s2})
+	if len(merged) != 0 {
+		t.Fatalf("expected all-dead merge to return empty, got %d", len(merged))
 	}
 }

@@ -51,6 +51,21 @@ type ExtractedGrammar struct {
 
 	// External token index -> grammar symbol ID.
 	ExternalSymbols []uint16
+
+	// ABI 15: reserved words (flat array, 0-terminated per set).
+	ReservedWords          []uint16
+	MaxReservedWordSetSize int
+
+	// ABI 15: supertype data.
+	SupertypeCount      int
+	SupertypeSymbols    []uint16
+	SupertypeMapSlices  [][2]uint16
+	SupertypeMapEntries []uint16
+
+	// ABI 15: language metadata version.
+	LanguageMetadataMajor int
+	LanguageMetadataMinor int
+	LanguageMetadataPatch int
 }
 
 // FieldMapEntry mirrors gotreesitter.FieldMapEntry for code generation.
@@ -89,8 +104,9 @@ type ExtractedAction struct {
 
 // LexModeEntry maps a parser state to its lexer configuration.
 type LexModeEntry struct {
-	LexState         int
-	ExternalLexState int
+	LexState          int
+	ExternalLexState  int
+	ReservedWordSetID int // ABI 15; 0 if not present
 }
 
 // LexStateEntry is a normalized lexer state extracted from ts_lex/ts_lex_keywords.
@@ -179,6 +195,17 @@ func ExtractGrammar(source string) (*ExtractedGrammar, error) {
 		}
 	}
 
+	// ABI 15 optional arrays — non-fatal if absent.
+	if err := extractReservedWords(source, g); err != nil {
+		// Not fatal: ABI < 15 grammars won't have reserved words.
+	}
+	if err := extractSupertypes(source, g); err != nil {
+		// Not fatal: ABI < 15 grammars or grammars without supertypes.
+	}
+	if err := extractLanguageMetadata(source, g); err != nil {
+		// Not fatal: ABI < 15 grammars won't have metadata.
+	}
+
 	return g, nil
 }
 
@@ -215,6 +242,7 @@ func extractConstants(source string, g *ExtractedGrammar) error {
 		"PRODUCTION_ID_COUNT":  &g.ProductionIDCount,
 		"EXTERNAL_TOKEN_COUNT": &g.ExternalTokenCount,
 		"MAX_ALIAS_SEQUENCE_LENGTH": &g.MaxAliasSeqLength,
+		"SUPERTYPE_COUNT":           &g.SupertypeCount,
 	}
 
 	re := regexp.MustCompile(`#define\s+(\w+)\s+(\d+)`)
@@ -1423,6 +1451,7 @@ func extractLexModes(source string, g *ExtractedGrammar) error {
 
 	lexStateRe := regexp.MustCompile(`\.lex_state\s*=\s*(\d+)`)
 	extLexRe := regexp.MustCompile(`\.external_lex_state\s*=\s*(\d+)`)
+	rwSetRe := regexp.MustCompile(`\.reserved_word_set_id\s*=\s*(\d+)`)
 
 	for _, m := range matches {
 		idx, err := strconv.Atoi(m[1])
@@ -1436,6 +1465,9 @@ func extractLexModes(source string, g *ExtractedGrammar) error {
 		}
 		if em := extLexRe.FindStringSubmatch(fields); em != nil {
 			entry.ExternalLexState, _ = strconv.Atoi(em[1])
+		}
+		if rw := rwSetRe.FindStringSubmatch(fields); rw != nil {
+			entry.ReservedWordSetID, _ = strconv.Atoi(rw[1])
 		}
 		modes[idx] = entry
 	}
@@ -1503,6 +1535,176 @@ func extractLexStates(source string, g *ExtractedGrammar) error {
 	if dfa.HasKeywordCapture {
 		g.KeywordCaptureToken = int(dfa.KeywordCapture)
 	}
+	return nil
+}
+
+// extractReservedWords parses the ts_reserved_words[][] 2D array (ABI 15).
+// Returns nil (not error) if the array is not found (ABI < 15).
+func extractReservedWords(source string, g *ExtractedGrammar) error {
+	dimRe := regexp.MustCompile(`ts_reserved_words\[(\d+)\]\[(\d+)\]`)
+	dm := dimRe.FindStringSubmatch(source)
+	if dm == nil {
+		return nil
+	}
+	setCount, _ := strconv.Atoi(dm[1])
+	setSize, _ := strconv.Atoi(dm[2])
+	if setCount == 0 || setSize == 0 {
+		return nil
+	}
+	g.MaxReservedWordSetSize = setSize
+
+	body, err := findArrayBody(source, "ts_reserved_words")
+	if err != nil {
+		return nil
+	}
+
+	flat := make([]uint16, setCount*setSize)
+
+	idxRe := regexp.MustCompile(`\[(\w+)\]\s*=\s*\{`)
+	locs := idxRe.FindAllStringSubmatchIndex(body, -1)
+
+	for _, loc := range locs {
+		name := body[loc[2]:loc[3]]
+		setIdx, ok := resolveIndexedName(name, g.enumValues)
+		if !ok || setIdx < 0 || setIdx >= setCount {
+			continue
+		}
+
+		braceStart := loc[1] - 1
+		depth := 0
+		end := braceStart
+		for i := braceStart; i < len(body); i++ {
+			if body[i] == '{' {
+				depth++
+			} else if body[i] == '}' {
+				depth--
+				if depth == 0 {
+					end = i
+					break
+				}
+			}
+		}
+
+		inner := body[braceStart+1 : end]
+		tokenRe := regexp.MustCompile(`\b([A-Za-z_]\w*|\d+)\b`)
+		toks := tokenRe.FindAllStringSubmatch(inner, -1)
+		offset := setIdx * setSize
+		for i, t := range toks {
+			if i >= setSize {
+				break
+			}
+			sym, ok := resolveIndexedName(t[1], g.enumValues)
+			if !ok {
+				continue
+			}
+			flat[offset+i] = uint16(sym)
+		}
+	}
+
+	g.ReservedWords = flat
+	return nil
+}
+
+// extractSupertypes parses the ABI 15 supertype arrays:
+// ts_supertype_symbols[], ts_supertype_map_slices[], ts_supertype_map_entries[].
+// Returns nil (not error) if the arrays are not found (ABI < 15).
+func extractSupertypes(source string, g *ExtractedGrammar) error {
+	if g.SupertypeCount == 0 {
+		return nil
+	}
+
+	symBody, err := findArrayBody(source, "ts_supertype_symbols")
+	if err != nil {
+		return nil
+	}
+	g.SupertypeSymbols = parseIndexedSymbolArray(symBody, g.SupertypeCount, g.enumValues)
+
+	sliceBody, err := findArrayBody(source, "ts_supertype_map_slices")
+	if err != nil {
+		return nil
+	}
+
+	idxRe := regexp.MustCompile(`\[(\w+)\]\s*=\s*\{([^}]*)\}`)
+	matches := idxRe.FindAllStringSubmatch(sliceBody, -1)
+	maxIdx := -1
+	type sliceEntry struct {
+		idx    int
+		index  uint16
+		length uint16
+	}
+	var entries []sliceEntry
+	for _, m := range matches {
+		idx, ok := resolveIndexedName(m[1], g.enumValues)
+		if !ok || idx < 0 {
+			continue
+		}
+		if idx > maxIdx {
+			maxIdx = idx
+		}
+		values := parseFieldIntPairs(m[2])
+		var index, length uint16
+		if len(values) >= 2 {
+			index = values[0]
+			length = values[1]
+		}
+		entries = append(entries, sliceEntry{idx: idx, index: index, length: length})
+	}
+
+	if maxIdx >= 0 {
+		slices := make([][2]uint16, maxIdx+1)
+		for _, e := range entries {
+			if e.idx < len(slices) {
+				slices[e.idx] = [2]uint16{e.index, e.length}
+			}
+		}
+		g.SupertypeMapSlices = slices
+	}
+
+	entryBody, err := findArrayBody(source, "ts_supertype_map_entries")
+	if err != nil {
+		return nil
+	}
+
+	tokenRe := regexp.MustCompile(`\b([A-Za-z_]\w*|\d+)\b`)
+	toks := tokenRe.FindAllStringSubmatch(entryBody, -1)
+	var mapEntries []uint16
+	for _, t := range toks {
+		sym, ok := resolveIndexedName(t[1], g.enumValues)
+		if !ok {
+			continue
+		}
+		mapEntries = append(mapEntries, uint16(sym))
+	}
+	g.SupertypeMapEntries = mapEntries
+
+	return nil
+}
+
+// extractLanguageMetadata parses the .metadata block from the TSLanguage struct
+// initializer at the bottom of parser.c (ABI 15).
+// Returns nil (not error) if the metadata block is not found (ABI < 15).
+func extractLanguageMetadata(source string, g *ExtractedGrammar) error {
+	metaRe := regexp.MustCompile(`\.metadata\s*=\s*\{([^}]*)\}`)
+	m := metaRe.FindStringSubmatch(source)
+	if m == nil {
+		return nil
+	}
+	fields := m[1]
+
+	majorRe := regexp.MustCompile(`\.major_version\s*=\s*(\d+)`)
+	minorRe := regexp.MustCompile(`\.minor_version\s*=\s*(\d+)`)
+	patchRe := regexp.MustCompile(`\.patch_version\s*=\s*(\d+)`)
+
+	if mv := majorRe.FindStringSubmatch(fields); mv != nil {
+		g.LanguageMetadataMajor, _ = strconv.Atoi(mv[1])
+	}
+	if mv := minorRe.FindStringSubmatch(fields); mv != nil {
+		g.LanguageMetadataMinor, _ = strconv.Atoi(mv[1])
+	}
+	if mv := patchRe.FindStringSubmatch(fields); mv != nil {
+		g.LanguageMetadataPatch, _ = strconv.Atoi(mv[1])
+	}
+
 	return nil
 }
 

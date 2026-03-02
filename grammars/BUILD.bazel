@@ -1,0 +1,13 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "grammars",
+    srcs = glob(
+        ["*.go"],
+        exclude = ["*_test.go"],
+    ),
+    embedsrcs = glob(["grammar_blobs/*.bin"]),
+    importpath = "github.com/odvcencio/gotreesitter/grammars",
+    visibility = ["//visibility:public"],
+    deps = ["//:gotreesitter"],
+)

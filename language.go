@@ -5,7 +5,10 @@
 // which the lexer, parser, query engine, and syntax tree are built.
 package gotreesitter
 
-import "sync"
+import (
+	"slices"
+	"sync"
+)
 
 // Symbol is a grammar symbol ID (terminal or nonterminal).
 type Symbol uint16
@@ -29,7 +32,7 @@ const (
 const (
 	// RuntimeLanguageVersion is the maximum tree-sitter language version this
 	// runtime is known to support.
-	RuntimeLanguageVersion uint32 = 14
+	RuntimeLanguageVersion uint32 = 15
 	// MinCompatibleLanguageVersion is the minimum accepted language version.
 	MinCompatibleLanguageVersion uint32 = 13
 )
@@ -72,8 +75,16 @@ type LexTransition struct {
 
 // LexMode maps a parser state to its lexer configuration.
 type LexMode struct {
-	LexState         uint16
-	ExternalLexState uint16
+	LexState           uint16
+	ExternalLexState   uint16
+	ReservedWordSetID  uint16
+}
+
+// LanguageMetadata holds the grammar's semantic version (ABI 15+).
+type LanguageMetadata struct {
+	MajorVersion uint8
+	MinorVersion uint8
+	PatchVersion uint8
 }
 
 // SymbolMetadata holds display information about a symbol.
@@ -94,6 +105,10 @@ type FieldMapEntry struct {
 // ExternalScanner is the interface for language-specific external scanners.
 // Languages like Python and JavaScript need these for indent tracking,
 // template literals, regex vs division, etc.
+//
+// The value returned by Create must be accepted by Destroy/Serialize/
+// Deserialize/Scan for that scanner implementation. Most scanners use a
+// concrete payload pointer type and will panic on mismatched payload types.
 type ExternalScanner interface {
 	Create() any
 	Destroy(payload any)
@@ -147,6 +162,19 @@ type Language struct {
 
 	// Primary state IDs (for table dedup)
 	PrimaryStateIDs []StateID
+
+	// ABI 15: Reserved words — flat array indexed by
+	// (reserved_word_set_id * MaxReservedWordSetSize + i), terminated by 0.
+	ReservedWords          []Symbol
+	MaxReservedWordSetSize uint16
+
+	// ABI 15: Supertype hierarchy
+	SupertypeSymbols    []Symbol
+	SupertypeMapSlices  [][2]uint16 // [supertype_symbol] -> (index, length)
+	SupertypeMapEntries []Symbol
+
+	// ABI 15: Grammar semantic version
+	Metadata LanguageMetadata
 
 	// External scanner (nil if not needed)
 	ExternalScanner ExternalScanner
@@ -244,6 +272,35 @@ func (l *Language) CanonicalSymbol(sym Symbol) Symbol {
 		return l.canonicalSymbols[sym]
 	}
 	return sym
+}
+
+// IsSupertype reports whether sym is a supertype symbol.
+func (l *Language) IsSupertype(sym Symbol) bool {
+	if l == nil {
+		return false
+	}
+	return slices.Contains(l.SupertypeSymbols, sym)
+}
+
+// SupertypeChildren returns the subtype symbols for a given supertype.
+// Returns nil if sym is not a supertype or has no entries.
+func (l *Language) SupertypeChildren(sym Symbol) []Symbol {
+	if l == nil {
+		return nil
+	}
+	idx := int(sym)
+	if idx >= len(l.SupertypeMapSlices) {
+		return nil
+	}
+	slice := l.SupertypeMapSlices[idx]
+	start, length := int(slice[0]), int(slice[1])
+	if length == 0 {
+		return nil
+	}
+	if start+length > len(l.SupertypeMapEntries) {
+		return nil
+	}
+	return l.SupertypeMapEntries[start : start+length]
 }
 
 // FieldByName returns the field ID for a given name, or (0, false) if not found.

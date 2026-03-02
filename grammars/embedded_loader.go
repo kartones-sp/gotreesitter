@@ -8,11 +8,23 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/odvcencio/gotreesitter"
 )
+
+// externalScannerRegistry maps language names (e.g. "javascript") to their
+// hand-written external scanners. Populated by zzz_scanner_attachments.go
+// init() before any Language function is called.
+var externalScannerRegistry = map[string]gotreesitter.ExternalScanner{}
+
+// RegisterExternalScanner registers an external scanner for a language name.
+// This is called during init() by zzz_scanner_attachments.go.
+func RegisterExternalScanner(name string, s gotreesitter.ExternalScanner) {
+	externalScannerRegistry[name] = s
+}
 
 type embeddedLanguageCacheEntry struct {
 	blobName   string
@@ -58,14 +70,16 @@ func loadEmbeddedLanguage(blobName string) *gotreesitter.Language {
 	entry := getEmbeddedLanguageCacheEntry(blobName)
 	entry.once.Do(func() {
 		entry.lang, entry.err = decodeEmbeddedLanguage(blobName)
-		if entry.err == nil && entry.lang.ExternalScanner == nil {
-			if scanner, ok := blobScannerMap[blobName]; ok {
-				entry.lang.ExternalScanner = scanner
+		if entry.err == nil {
+			// Attach external scanner if one is registered for this language.
+			name := strings.TrimSuffix(blobName, ".bin")
+			if s, ok := externalScannerRegistry[name]; ok {
+				entry.lang.ExternalScanner = s
 			}
 		}
 	})
 	if entry.err != nil {
-		panic(entry.err)
+		panic(fmt.Sprintf("gotreesitter: failed to load grammar %q: %v", blobName, entry.err))
 	}
 	recordEmbeddedLanguageUse(entry)
 	return entry.lang

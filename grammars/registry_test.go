@@ -52,196 +52,82 @@ func TestDetectLanguageByShebang(t *testing.T) {
 	}
 }
 
-func TestAuditParseSupportIncludesGoCustomTokenSource(t *testing.T) {
-	reports := AuditParseSupport()
-	if len(reports) == 0 {
-		t.Fatal("expected parse support reports")
-	}
-
-	var goReport *ParseSupport
-	for i := range reports {
-		if reports[i].Name == "go" {
-			goReport = &reports[i]
-			break
+// parseSupportForLang evaluates parse support for a single language by name,
+// loading only that grammar instead of all 206.
+func parseSupportForLang(t *testing.T, name string) ParseSupport {
+	t.Helper()
+	entries := AllLanguages()
+	for _, entry := range entries {
+		if entry.Name == name {
+			lang := entry.Language()
+			t.Cleanup(func() { UnloadEmbeddedLanguage(entry.Name + ".bin") })
+			return EvaluateParseSupport(entry, lang)
 		}
 	}
-	if goReport == nil {
-		t.Fatal("expected go parse support report")
-	}
-	if goReport.Backend != ParseBackendTokenSource {
-		t.Fatalf("expected go backend %q, got %q", ParseBackendTokenSource, goReport.Backend)
+	t.Fatalf("language %q not registered", name)
+	return ParseSupport{}
+}
+
+func TestAuditParseSupportIncludesGoCustomTokenSource(t *testing.T) {
+	report := parseSupportForLang(t, "go")
+	if report.Backend != ParseBackendTokenSource {
+		t.Fatalf("expected go backend %q, got %q", ParseBackendTokenSource, report.Backend)
 	}
 }
 
 func TestAuditParseSupportIncludesCCustomTokenSource(t *testing.T) {
-	reports := AuditParseSupport()
-	if len(reports) == 0 {
-		t.Fatal("expected parse support reports")
-	}
-
-	var cReport *ParseSupport
-	for i := range reports {
-		if reports[i].Name == "c" {
-			cReport = &reports[i]
-			break
-		}
-	}
-	if cReport == nil {
-		t.Fatal("expected c parse support report")
-	}
-	if cReport.Backend != ParseBackendTokenSource {
-		t.Fatalf("expected c backend %q, got %q", ParseBackendTokenSource, cReport.Backend)
+	report := parseSupportForLang(t, "c")
+	if report.Backend != ParseBackendTokenSource {
+		t.Fatalf("expected c backend %q, got %q", ParseBackendTokenSource, report.Backend)
 	}
 }
 
 func TestAuditParseSupportIncludesCppDFA(t *testing.T) {
-	reports := AuditParseSupport()
-	if len(reports) == 0 {
-		t.Fatal("expected parse support reports")
-	}
-
-	var cppReport *ParseSupport
-	for i := range reports {
-		if reports[i].Name == "cpp" {
-			cppReport = &reports[i]
-			break
-		}
-	}
-	if cppReport == nil {
-		t.Fatal("expected cpp parse support report")
-	}
-	if cppReport.Backend != ParseBackendDFA {
-		t.Fatalf("expected cpp backend %q, got %q", ParseBackendDFA, cppReport.Backend)
+	report := parseSupportForLang(t, "cpp")
+	if report.Backend != ParseBackendDFA {
+		t.Fatalf("expected cpp backend %q, got %q", ParseBackendDFA, report.Backend)
 	}
 }
 
 func TestAuditParseSupportIncludesJSONCustomTokenSource(t *testing.T) {
-	reports := AuditParseSupport()
-	if len(reports) == 0 {
-		t.Fatal("expected parse support reports")
-	}
-
-	var jsonReport *ParseSupport
-	for i := range reports {
-		if reports[i].Name == "json" {
-			jsonReport = &reports[i]
-			break
-		}
-	}
-	if jsonReport == nil {
-		t.Fatal("expected json parse support report")
-	}
-	if jsonReport.Backend != ParseBackendTokenSource {
-		t.Fatalf("expected json backend %q, got %q", ParseBackendTokenSource, jsonReport.Backend)
+	report := parseSupportForLang(t, "json")
+	if report.Backend != ParseBackendTokenSource {
+		t.Fatalf("expected json backend %q, got %q", ParseBackendTokenSource, report.Backend)
 	}
 }
 
 func TestAuditParseSupportIncludesJavaCustomTokenSource(t *testing.T) {
-	reports := AuditParseSupport()
-	if len(reports) == 0 {
-		t.Fatal("expected parse support reports")
-	}
-
-	var javaReport *ParseSupport
-	for i := range reports {
-		if reports[i].Name == "java" {
-			javaReport = &reports[i]
-			break
-		}
-	}
-	if javaReport == nil {
-		t.Fatal("expected java parse support report")
-	}
-	if javaReport.Backend != ParseBackendTokenSource {
-		t.Fatalf("expected java backend %q, got %q", ParseBackendTokenSource, javaReport.Backend)
+	report := parseSupportForLang(t, "java")
+	if report.Backend != ParseBackendTokenSource {
+		t.Fatalf("expected java backend %q, got %q", ParseBackendTokenSource, report.Backend)
 	}
 }
 
 func TestAuditParseSupportIncludesLuaCustomTokenSource(t *testing.T) {
-	reports := AuditParseSupport()
-	if len(reports) == 0 {
-		t.Fatal("expected parse support reports")
-	}
-
-	var luaReport *ParseSupport
-	for i := range reports {
-		if reports[i].Name == "lua" {
-			luaReport = &reports[i]
-			break
-		}
-	}
-	if luaReport == nil {
-		t.Fatal("expected lua parse support report")
-	}
-	if luaReport.Backend != ParseBackendTokenSource {
-		t.Fatalf("expected lua backend %q, got %q", ParseBackendTokenSource, luaReport.Backend)
+	report := parseSupportForLang(t, "lua")
+	if report.Backend != ParseBackendTokenSource {
+		t.Fatalf("expected lua backend %q, got %q", ParseBackendTokenSource, report.Backend)
 	}
 }
 
 func TestAuditParseSupportIncludesJavaScriptDFA(t *testing.T) {
-	reports := AuditParseSupport()
-	if len(reports) == 0 {
-		t.Fatal("expected parse support reports")
-	}
-
-	var jsReport *ParseSupport
-	for i := range reports {
-		if reports[i].Name == "javascript" {
-			jsReport = &reports[i]
-			break
-		}
-	}
-	if jsReport == nil {
-		t.Fatal("expected javascript parse support report")
-	}
-	// External scanner for JS is temporarily disabled (symbol ID mismatch
-	// after blob regen). Synthetic ASI scanner is used instead → dfa-partial.
-	if jsReport.Backend != ParseBackendDFAPartial {
-		t.Fatalf("expected javascript backend %q, got %q", ParseBackendDFAPartial, jsReport.Backend)
+	report := parseSupportForLang(t, "javascript")
+	if report.Backend != ParseBackendDFA {
+		t.Fatalf("expected javascript backend %q, got %q", ParseBackendDFA, report.Backend)
 	}
 }
 
 func TestAuditParseSupportIncludesTypeScriptDFA(t *testing.T) {
-	reports := AuditParseSupport()
-	if len(reports) == 0 {
-		t.Fatal("expected parse support reports")
-	}
-
-	var tsReport *ParseSupport
-	for i := range reports {
-		if reports[i].Name == "typescript" {
-			tsReport = &reports[i]
-			break
-		}
-	}
-	if tsReport == nil {
-		t.Fatal("expected typescript parse support report")
-	}
-	// External scanner for TS is temporarily disabled (symbol ID mismatch
-	// after blob regen). Synthetic ASI scanner is used instead → dfa-partial.
-	if tsReport.Backend != ParseBackendDFAPartial {
-		t.Fatalf("expected typescript backend %q, got %q", ParseBackendDFAPartial, tsReport.Backend)
+	report := parseSupportForLang(t, "typescript")
+	if report.Backend != ParseBackendDFA {
+		t.Fatalf("expected typescript backend %q, got %q", ParseBackendDFA, report.Backend)
 	}
 }
 
 func TestAuditParseSupportIncludesRustDFA(t *testing.T) {
-	reports := AuditParseSupport()
-	if len(reports) == 0 {
-		t.Fatal("expected parse support reports")
-	}
-
-	var rustReport *ParseSupport
-	for i := range reports {
-		if reports[i].Name == "rust" {
-			rustReport = &reports[i]
-			break
-		}
-	}
-	if rustReport == nil {
-		t.Fatal("expected rust parse support report")
-	}
-	if rustReport.Backend != ParseBackendDFA {
-		t.Fatalf("expected rust backend %q, got %q", ParseBackendDFA, rustReport.Backend)
+	report := parseSupportForLang(t, "rust")
+	if report.Backend != ParseBackendDFA {
+		t.Fatalf("expected rust backend %q, got %q", ParseBackendDFA, report.Backend)
 	}
 }
 

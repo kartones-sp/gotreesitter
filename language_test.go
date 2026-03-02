@@ -409,6 +409,58 @@ func TestParseActionFields(t *testing.T) {
 	}
 }
 
+func TestLanguageIsSupertype(t *testing.T) {
+	lang := &Language{
+		SupertypeSymbols: []Symbol{10, 20},
+	}
+	if !lang.IsSupertype(Symbol(10)) {
+		t.Error("10 should be supertype")
+	}
+	if !lang.IsSupertype(Symbol(20)) {
+		t.Error("20 should be supertype")
+	}
+	if lang.IsSupertype(Symbol(5)) {
+		t.Error("5 should not be supertype")
+	}
+	// nil language edge case
+	var nilLang *Language
+	if nilLang.IsSupertype(Symbol(1)) {
+		t.Error("nil language should return false")
+	}
+}
+
+func TestLanguageSupertypeChildren(t *testing.T) {
+	lang := &Language{
+		SupertypeMapSlices:  make([][2]uint16, 11),
+		SupertypeMapEntries: []Symbol{20, 21, 22},
+	}
+	lang.SupertypeMapSlices[10] = [2]uint16{0, 3}
+
+	children := lang.SupertypeChildren(Symbol(10))
+	if len(children) != 3 {
+		t.Fatalf("got %d children, want 3", len(children))
+	}
+	if children[0] != 20 || children[1] != 21 || children[2] != 22 {
+		t.Errorf("wrong children: %v", children)
+	}
+
+	// Out of range
+	if got := lang.SupertypeChildren(Symbol(999)); got != nil {
+		t.Errorf("out of range should return nil, got %v", got)
+	}
+
+	// No entries (zero-value slice at index 5)
+	if got := lang.SupertypeChildren(Symbol(5)); got != nil {
+		t.Errorf("no entries should return nil, got %v", got)
+	}
+
+	// nil language edge case
+	var nilLang *Language
+	if got := nilLang.SupertypeChildren(Symbol(1)); got != nil {
+		t.Errorf("nil language should return nil, got %v", got)
+	}
+}
+
 // TestTypeAliases verifies that Symbol, StateID, and FieldID are distinct
 // types based on uint16, ensuring type safety at compile time.
 func TestTypeAliases(t *testing.T) {

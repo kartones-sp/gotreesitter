@@ -9,10 +9,15 @@
 # Build artifacts
 scannertest
 ts2go
+tsquery
 parity_report
 
 # Logs
 *.log
+*.prof
+
+# Benchmark outputs
+cgo_harness/reports/
 
 # IDE
 .idea/

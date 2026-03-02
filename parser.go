@@ -2,781 +2,192 @@ package gotreesitter
 
 import (
 	"bytes"
-	"errors"
-	"fmt"
-	"os"
 	"sync"
-	"unicode/utf8"
+	"time"
 )
 
 // Parser reads parse tables from a Language and produces a syntax tree.
 // It supports GLR parsing: when a (state, symbol) pair maps to multiple
 // actions, the parser forks the stack and explores all alternatives in
-// parallel, merging stacks that converge on the same state and picking
-// the highest dynamic-precedence winner for ambiguities.
+// parallel while preserving distinct parse paths. Duplicate stack
+// versions are collapsed and ambiguities are resolved at selection time.
+//
+// Parser is not safe for concurrent use. Use one parser per goroutine, or
+// guard shared parser instances with external synchronization.
 type Parser struct {
-	language     *Language
-	reuseCursor  reuseCursor
-	reuseScratch reuseScratch
-	reuseMu      sync.Mutex
+	language          *Language
+	reuseCursor       reuseCursor
+	reuseScratch      reuseScratch
+	reuseMu           sync.Mutex
+	fullArenaHint     uint32
+	hasRecoverState   []bool
+	hasRecoverSymbol  []bool
+	recoverByState    [][]recoverSymbolAction
+	hasKeywordState   []bool
+	forceRawSpanAll   bool
+	forceRawSpanTable []bool
+	included          []Range
+	denseLimit        int
+	smallBase         int
+	smallLookup       [][]smallActionPair
 }
 
-type parserScratch struct {
-	merge   glrMergeScratch
-	entries glrEntryScratch
+type smallActionPair struct {
+	sym uint16
+	val uint16
 }
 
-var parserScratchPool = sync.Pool{
-	New: func() any {
-		return &parserScratch{}
-	},
+type recoverSymbolAction struct {
+	sym    uint16
+	action ParseAction
 }
 
-func acquireParserScratch() *parserScratch {
-	return parserScratchPool.Get().(*parserScratch)
+const (
+	// maxForkCloneDepth limits GLR stack cloning for pathological ambiguity.
+	// Above this depth, we execute only the first action to avoid runaway work.
+	maxForkCloneDepth = 4 * 1024
+	// maxConsecutivePrimaryReduces prevents infinite reduce loops on the
+	// primary stack when no token advancement occurs.
+	maxConsecutivePrimaryReduces = 10
+)
+
+// IncrementalParseProfile attributes incremental parse time into coarse buckets.
+//
+// ReuseCursorNanos includes reuse-cursor setup and subtree-candidate checks.
+// ReparseNanos includes the remainder of incremental parsing/rebuild work.
+type IncrementalParseProfile struct {
+	ReuseCursorNanos   int64
+	ReparseNanos       int64
+	ReusedSubtrees     uint64
+	ReusedBytes        uint64
+	NewNodesAllocated  uint64
+	RecoverSearches    uint64
+	RecoverStateChecks uint64
+	RecoverStateSkips  uint64
+	RecoverSymbolSkips uint64
+	RecoverLookups     uint64
+	RecoverHits        uint64
+	MaxStacksSeen      int
+	EntryScratchPeak   uint64
 }
 
-func releaseParserScratch(s *parserScratch) {
-	if s == nil {
-		return
-	}
-	s.merge.result = s.merge.result[:0]
-	s.entries.reset()
-	parserScratchPool.Put(s)
+type incrementalParseTiming struct {
+	totalNanos         int64
+	reuseNanos         int64
+	reusedSubtrees     uint64
+	reusedBytes        uint64
+	newNodes           uint64
+	recoverSearches    uint64
+	recoverStateChecks uint64
+	recoverStateSkips  uint64
+	recoverSymbolSkips uint64
+	recoverLookups     uint64
+	recoverHits        uint64
+	maxStacksSeen      int
+	entryScratchPeak   uint64
+}
+
+type parseReuseState struct {
+	reusedAny bool
+	arenaRefs []*nodeArena
 }
 
 // NewParser creates a new Parser for the given language.
 func NewParser(lang *Language) *Parser {
-	return &Parser{language: lang}
+	p := &Parser{language: lang}
+	if lang != nil {
+		p.forceRawSpanAll = lang.Name == "yaml"
+		for i, name := range lang.SymbolNames {
+			if name != "statement_list" {
+				continue
+			}
+			if p.forceRawSpanTable == nil {
+				p.forceRawSpanTable = make([]bool, len(lang.SymbolNames))
+			}
+			p.forceRawSpanTable[i] = true
+		}
+		if lang.LargeStateCount > 0 {
+			p.denseLimit = int(lang.LargeStateCount)
+		} else {
+			p.denseLimit = len(lang.ParseTable)
+		}
+		p.smallBase = int(lang.LargeStateCount)
+		if len(lang.SmallParseTableMap) > 0 && len(lang.SmallParseTable) > 0 {
+			p.smallLookup = buildSmallLookup(lang)
+		}
+		p.recoverByState, p.hasRecoverState, p.hasRecoverSymbol = buildRecoverActionsByState(lang)
+		p.hasKeywordState = buildKeywordStates(lang)
+	}
+	return p
 }
 
-// TokenSource provides tokens to the parser. This interface abstracts over
-// different lexer implementations: the built-in DFA lexer (for hand-built
-// grammars) or custom bridges like GoTokenSource (for real grammars where
-// we can't extract the C lexer DFA).
-type TokenSource interface {
-	// Next returns the next token. It should skip whitespace and comments
-	// as appropriate for the language. Returns a zero-Symbol token at EOF.
-	Next() Token
-}
-
-// ByteSkippableTokenSource can jump to a byte offset and return the first
-// token at or after that position.
-type ByteSkippableTokenSource interface {
-	TokenSource
-	SkipToByte(offset uint32) Token
-}
-
-// PointSkippableTokenSource extends ByteSkippableTokenSource with a hint-based
-// skip that avoids recomputing row/column from byte offset. During incremental
-// parsing the reused node already carries its endpoint, so passing it directly
-// eliminates the O(n) offset-to-point scan.
-type PointSkippableTokenSource interface {
-	ByteSkippableTokenSource
-	SkipToByteWithPoint(offset uint32, pt Point) Token
-}
-
-// stackEntry is a single entry on the parser's LR stack, pairing a parser
-// state with the syntax tree node that was shifted or reduced into that state.
-type stackEntry struct {
-	state StateID
-	node  *Node
-}
-
-// errorSymbol is the well-known symbol ID used for error nodes.
-const errorSymbol = Symbol(65535)
-
-// Parse tokenizes and parses source using the built-in DFA lexer, returning
-// a syntax tree. This works for hand-built grammars that provide LexStates.
-// For real grammars that need a custom lexer, use ParseWithTokenSource.
-// If the input is empty, it returns a tree with a nil root and no error.
-func (p *Parser) Parse(source []byte) (*Tree, error) {
-	if err := p.checkLanguageCompatible(); err != nil {
-		return nil, err
-	}
-	if err := p.checkDFALexer(); err != nil {
-		return nil, err
-	}
-	lexer := NewLexer(p.language.LexStates, source)
-	ts := &dfaTokenSource{
-		lexer:               lexer,
-		language:            p.language,
-		lookupActionIndex:   p.lookupActionIndex,
-		lastSyntheticExtPos: -1,
-	}
-	if p.language.ExternalScanner != nil {
-		ts.externalPayload = p.language.ExternalScanner.Create()
-	}
-	return p.parseInternal(source, ts, nil, nil, arenaClassFull), nil
-}
-
-// ParseWithTokenSource parses source using a custom token source.
-// This is used for real grammars where the lexer DFA isn't available
-// as data tables (e.g., Go grammar using go/scanner as a bridge).
-func (p *Parser) ParseWithTokenSource(source []byte, ts TokenSource) (*Tree, error) {
-	if err := p.checkLanguageCompatible(); err != nil {
-		return nil, err
-	}
-	return p.parseInternal(source, ts, nil, nil, arenaClassFull), nil
-}
-
-// ParseIncremental re-parses source after edits were applied to oldTree.
-// It reuses unchanged subtrees from the old tree for better performance.
-// Call oldTree.Edit() for each edit before calling this method.
-func (p *Parser) ParseIncremental(source []byte, oldTree *Tree) (*Tree, error) {
-	if err := p.checkLanguageCompatible(); err != nil {
-		return nil, err
-	}
-	if err := p.checkDFALexer(); err != nil {
-		return nil, err
-	}
-	lexer := NewLexer(p.language.LexStates, source)
-	ts := &dfaTokenSource{
-		lexer:               lexer,
-		language:            p.language,
-		lookupActionIndex:   p.lookupActionIndex,
-		lastSyntheticExtPos: -1,
-	}
-	if p.language.ExternalScanner != nil {
-		ts.externalPayload = p.language.ExternalScanner.Create()
-	}
-	return p.parseIncrementalInternal(source, oldTree, ts), nil
-}
-
-// ParseIncrementalWithTokenSource is like ParseIncremental but uses a custom
-// token source.
-func (p *Parser) ParseIncrementalWithTokenSource(source []byte, oldTree *Tree, ts TokenSource) (*Tree, error) {
-	if err := p.checkLanguageCompatible(); err != nil {
-		return nil, err
-	}
-	return p.parseIncrementalInternal(source, oldTree, ts), nil
-}
-
-// ErrNoLanguage is returned when a Parser has no language configured.
-var ErrNoLanguage = errors.New("parser has no language configured")
-
-// checkLanguageCompatible returns an error if the parser's language is nil or
-// incompatible with the runtime.
-func (p *Parser) checkLanguageCompatible() error {
-	if p.language == nil {
-		return ErrNoLanguage
-	}
-	if !p.language.CompatibleWithRuntime() {
-		return fmt.Errorf("language version %d incompatible with parser", p.language.LanguageVersion)
-	}
-	return nil
-}
-
-// checkDFALexer returns an error if the parser's language has no DFA lexer tables.
-func (p *Parser) checkDFALexer() error {
-	if p.language == nil || len(p.language.LexStates) == 0 {
-		return fmt.Errorf("no DFA lexer available for language (use ParseWithTokenSource instead)")
-	}
-	return nil
-}
-
-func (p *Parser) parseIncrementalInternal(source []byte, oldTree *Tree, ts TokenSource) *Tree {
+func (p *Parser) parseIncrementalInternal(source []byte, oldTree *Tree, ts TokenSource, timing *incrementalParseTiming) *Tree {
 	// Fast path: unchanged source and no recorded edits.
-	if oldTree != nil &&
-		oldTree.language == p.language &&
-		len(oldTree.edits) == 0 &&
-		bytes.Equal(oldTree.source, source) {
+	if canReuseUnchangedTree(source, oldTree, p.language) {
 		return oldTree
+	}
+
+	// DFA with external scanner cannot safely skip — scanner state must be
+	// preserved token-by-token, so reuse is disabled for that combination.
+	// All other token sources (DFA without external scanner, custom lexers)
+	// support efficient skipping via PointSkippableTokenSource.
+	if _, isDFA := ts.(*dfaTokenSource); isDFA && p.language != nil && p.language.ExternalScanner != nil {
+		return p.parseInternal(source, ts, nil, nil, arenaClassFull, timing)
 	}
 
 	p.reuseMu.Lock()
 	defer p.reuseMu.Unlock()
 
-	reuse := p.reuseCursor.reset(oldTree, source, &p.reuseScratch)
-	tree := p.parseInternal(source, ts, reuse, oldTree, arenaClassIncremental)
+	var reuse *reuseCursor
+	if timing != nil {
+		reuseStart := time.Now()
+		reuse = p.reuseCursor.reset(oldTree, source, &p.reuseScratch)
+		timing.reuseNanos += time.Since(reuseStart).Nanoseconds()
+	} else {
+		reuse = p.reuseCursor.reset(oldTree, source, &p.reuseScratch)
+	}
+	arenaClass := incrementalArenaClassForSource(source)
+	tree := p.parseInternal(source, ts, reuse, oldTree, arenaClass, timing)
 	if reuse != nil {
-		reuse.commitScratch(&p.reuseScratch)
+		if timing != nil {
+			reuseStart := time.Now()
+			reuse.commitScratch(&p.reuseScratch)
+			timing.reuseNanos += time.Since(reuseStart).Nanoseconds()
+		} else {
+			reuse.commitScratch(&p.reuseScratch)
+		}
 	}
 	return tree
 }
 
-// dfaTokenSource wraps the built-in DFA Lexer as a TokenSource.
-// It tracks the current parser state to select the correct lex mode.
-type dfaTokenSource struct {
-	lexer    *Lexer
-	language *Language
-	state    StateID
-
-	lookupActionIndex    func(state StateID, sym Symbol) uint16
-	externalPayload      any
-	externalValid        []bool
-	lastSyntheticExtPos  int  // position of last synthetic external token (-1 = none)
-	lastSyntheticExtSym  Symbol
+func incrementalArenaClassForSource(source []byte) arenaClass {
+	arenaClass := arenaClassIncremental
+	// Very large files can outgrow incremental defaults and trigger repeated
+	// fallback allocations; use full-parse slab sizing only beyond this point.
+	const incrementalUseFullArenaThreshold = 1 * 1024 * 1024
+	if len(source) >= incrementalUseFullArenaThreshold {
+		arenaClass = arenaClassFull
+	}
+	return arenaClass
 }
 
-func (d *dfaTokenSource) Close() {
-	if d.language == nil || d.language.ExternalScanner == nil || d.externalPayload == nil {
-		return
+func canReuseUnchangedTree(source []byte, oldTree *Tree, lang *Language) bool {
+	if oldTree == nil || oldTree.language != lang || len(oldTree.edits) != 0 {
+		return false
 	}
-	d.language.ExternalScanner.Destroy(d.externalPayload)
-	d.externalPayload = nil
-}
-
-// DebugDFA enables trace logging for DFA token production.
-var DebugDFA bool
-
-// DebugGLR enables trace logging for GLR stack operations.
-var DebugGLR bool
-
-func (d *dfaTokenSource) Next() Token {
-	if tok, ok := d.nextExternalToken(); ok {
-		if DebugDFA {
-			name := ""
-			if int(tok.Symbol) < len(d.language.SymbolNames) {
-				name = d.language.SymbolNames[tok.Symbol]
-			}
-			println("  EXT tok", tok.Symbol, name, tok.StartByte, tok.EndByte, tok.Text)
-		}
-		return tok
+	oldSource := oldTree.source
+	if len(oldSource) != len(source) {
+		return false
 	}
-
-	lexState := uint16(0)
-	if int(d.state) < len(d.language.LexModes) {
-		lexState = d.language.LexModes[d.state].LexState
+	if len(source) == 0 {
+		return true
 	}
-	tok := d.lexer.Next(lexState)
-	tok = d.promoteKeyword(tok)
-	tok = d.resolveSymbolAlias(tok)
-	if DebugDFA {
-		name := ""
-		if int(tok.Symbol) < len(d.language.SymbolNames) {
-			name = d.language.SymbolNames[tok.Symbol]
-		}
-		println("  DFA tok", tok.Symbol, name, tok.StartByte, tok.EndByte, tok.Text, "state=", d.state, "lexState=", lexState)
+	// Common incremental no-edit case: caller passes the same source slice.
+	// Pointer equality avoids memcmp on hot no-op reparses.
+	if &oldSource[0] == &source[0] {
+		return true
 	}
-	return tok
-}
-
-func (d *dfaTokenSource) SkipToByte(offset uint32) Token {
-	target := int(offset)
-	if target < d.lexer.pos {
-		// Rewind isn't supported for DFA token sources during parse.
-		return d.Next()
-	}
-	for d.lexer.pos < target {
-		d.lexer.skipOneRune()
-	}
-	return d.Next()
-}
-
-func (d *dfaTokenSource) SkipToByteWithPoint(offset uint32, pt Point) Token {
-	target := int(offset)
-	if target > len(d.lexer.source) {
-		target = len(d.lexer.source)
-	}
-	if target >= d.lexer.pos {
-		d.lexer.pos = target
-		d.lexer.row = pt.Row
-		d.lexer.col = pt.Column
-	}
-	return d.Next()
-}
-
-func (d *dfaTokenSource) nextExternalToken() (Token, bool) {
-	if d.language == nil || d.lookupActionIndex == nil {
-		return Token{}, false
-	}
-	if len(d.language.ExternalSymbols) == 0 {
-		return Token{}, false
-	}
-
-	if cap(d.externalValid) < len(d.language.ExternalSymbols) {
-		d.externalValid = make([]bool, len(d.language.ExternalSymbols))
-	}
-	valid := d.externalValid[:len(d.language.ExternalSymbols)]
-	for i := range valid {
-		valid[i] = false
-	}
-
-	anyValid := false
-	for i, sym := range d.language.ExternalSymbols {
-		if d.lookupActionIndex(d.state, sym) != 0 {
-			valid[i] = true
-			anyValid = true
-		}
-	}
-	if !anyValid {
-		return Token{}, false
-	}
-
-	if d.language.ExternalScanner == nil {
-		return d.syntheticExternalToken(valid)
-	}
-
-	el := newExternalLexer(d.lexer.source, d.lexer.pos, d.lexer.row, d.lexer.col)
-	if !RunExternalScanner(d.language, d.externalPayload, el, valid) {
-		return Token{}, false
-	}
-	tok, ok := el.token()
-	if !ok {
-		return Token{}, false
-	}
-
-	d.lexer.pos = int(tok.EndByte)
-	d.lexer.row = tok.EndPoint.Row
-	d.lexer.col = tok.EndPoint.Column
-	return tok, true
-}
-
-func (d *dfaTokenSource) syntheticExternalToken(valid []bool) (Token, bool) {
-	// Conservative fallback when no external scanner is registered:
-	// synthesize automatic-semicolon style external tokens only when the
-	// grammar explicitly allows them in the current state.
-	if d.language == nil || d.lexer == nil {
-		return Token{}, false
-	}
-
-	for i, sym := range d.language.ExternalSymbols {
-		if i >= len(valid) || !valid[i] {
-			continue
-		}
-		// Guard against infinite zero-width synthetic token loops.
-		// If we already produced a synthetic token at this position for this
-		// symbol, don't produce another one — let the DFA lexer run instead.
-		if d.lexer.pos == d.lastSyntheticExtPos && sym == d.lastSyntheticExtSym {
-			continue
-		}
-		nameIdx := int(sym)
-		if nameIdx < 0 || nameIdx >= len(d.language.SymbolNames) {
-			continue
-		}
-		var tok Token
-		var ok bool
-		switch d.language.SymbolNames[nameIdx] {
-		case "_automatic_semicolon", "_function_signature_automatic_semicolon", "_implicit_semicolon":
-			tok, ok = d.syntheticAutomaticSemicolon(sym)
-		case "_line_break", "_newline":
-			tok, ok = d.syntheticLineBreak(sym)
-		case "_line_ending_or_eof":
-			tok, ok = d.syntheticLineEndingOrEOF(sym)
-		case "jsx_text":
-			tok, ok = d.syntheticJSXText(sym)
-		}
-		if ok {
-			d.lastSyntheticExtPos = d.lexer.pos
-			d.lastSyntheticExtSym = sym
-			return tok, true
-		}
-	}
-
-	return Token{}, false
-}
-
-func (d *dfaTokenSource) syntheticAutomaticSemicolon(sym Symbol) (Token, bool) {
-	if d.lexer == nil {
-		return Token{}, false
-	}
-	source := d.lexer.source
-	startPos := d.lexer.pos
-	startPoint := Point{Row: d.lexer.row, Column: d.lexer.col}
-
-	// EOF insertion is always allowed when the grammar requests it.
-	if startPos >= len(source) {
-		return Token{
-			Symbol:     sym,
-			StartByte:  uint32(startPos),
-			EndByte:    uint32(startPos),
-			StartPoint: startPoint,
-			EndPoint:   startPoint,
-		}, true
-	}
-
-	pos := startPos
-	endRow := d.lexer.row
-	endCol := d.lexer.col
-	sawLineBreak := false
-
-	// Consume horizontal space, then allow insertion on line break or EOF.
-	for pos < len(source) {
-		switch source[pos] {
-		case ' ', '\t', '\f':
-			pos++
-			endCol++
-		case '\r':
-			pos++
-			if pos < len(source) && source[pos] == '\n' {
-				pos++
-			}
-			endRow++
-			endCol = 0
-			sawLineBreak = true
-			goto done
-		case '\n':
-			pos++
-			endRow++
-			endCol = 0
-			sawLineBreak = true
-			goto done
-		case '}':
-			// ECMAScript ASI rule: insert semicolon before '}'.
-			return Token{
-				Symbol:     sym,
-				StartByte:  uint32(startPos),
-				EndByte:    uint32(pos),
-				StartPoint: startPoint,
-				EndPoint:   Point{Row: endRow, Column: endCol},
-			}, true
-		default:
-			return Token{}, false
-		}
-	}
-
-	// Reached EOF after horizontal space.
-	return Token{
-		Symbol:     sym,
-		StartByte:  uint32(startPos),
-		EndByte:    uint32(pos),
-		StartPoint: startPoint,
-		EndPoint:   Point{Row: endRow, Column: endCol},
-	}, true
-
-done:
-	if !sawLineBreak {
-		return Token{}, false
-	}
-
-	// Consume indentation after newline so lexing resumes at next token.
-	for pos < len(source) {
-		switch source[pos] {
-		case ' ', '\t', '\f':
-			pos++
-			endCol++
-		default:
-			return Token{
-				Symbol:     sym,
-				StartByte:  uint32(startPos),
-				EndByte:    uint32(pos),
-				StartPoint: startPoint,
-				EndPoint:   Point{Row: endRow, Column: endCol},
-			}, true
-		}
-	}
-
-	return Token{
-		Symbol:     sym,
-		StartByte:  uint32(startPos),
-		EndByte:    uint32(pos),
-		StartPoint: startPoint,
-		EndPoint:   Point{Row: endRow, Column: endCol},
-	}, true
-}
-
-func (d *dfaTokenSource) syntheticLineBreak(sym Symbol) (Token, bool) {
-	if d.lexer == nil {
-		return Token{}, false
-	}
-	source := d.lexer.source
-	startPos := d.lexer.pos
-	startPoint := Point{Row: d.lexer.row, Column: d.lexer.col}
-
-	pos := startPos
-	endRow := d.lexer.row
-	endCol := d.lexer.col
-
-	for pos < len(source) {
-		switch source[pos] {
-		case ' ', '\t', '\f':
-			pos++
-			endCol++
-		case '\r':
-			pos++
-			if pos < len(source) && source[pos] == '\n' {
-				pos++
-			}
-			endRow++
-			endCol = 0
-			goto consumeIndent
-		case '\n':
-			pos++
-			endRow++
-			endCol = 0
-			goto consumeIndent
-		default:
-			return Token{}, false
-		}
-	}
-
-	return Token{}, false
-
-consumeIndent:
-	for pos < len(source) {
-		switch source[pos] {
-		case ' ', '\t', '\f':
-			pos++
-			endCol++
-		default:
-			return Token{
-				Symbol:     sym,
-				StartByte:  uint32(startPos),
-				EndByte:    uint32(pos),
-				StartPoint: startPoint,
-				EndPoint:   Point{Row: endRow, Column: endCol},
-			}, true
-		}
-	}
-
-	return Token{
-		Symbol:     sym,
-		StartByte:  uint32(startPos),
-		EndByte:    uint32(pos),
-		StartPoint: startPoint,
-		EndPoint:   Point{Row: endRow, Column: endCol},
-	}, true
-}
-
-func (d *dfaTokenSource) syntheticLineEndingOrEOF(sym Symbol) (Token, bool) {
-	if d.lexer == nil {
-		return Token{}, false
-	}
-	if tok, ok := d.syntheticLineBreak(sym); ok {
-		return tok, true
-	}
-
-	source := d.lexer.source
-	startPos := d.lexer.pos
-	startPoint := Point{Row: d.lexer.row, Column: d.lexer.col}
-	if startPos >= len(source) {
-		return Token{
-			Symbol:     sym,
-			StartByte:  uint32(startPos),
-			EndByte:    uint32(startPos),
-			StartPoint: startPoint,
-			EndPoint:   startPoint,
-		}, true
-	}
-
-	pos := startPos
-	endCol := d.lexer.col
-	for pos < len(source) {
-		switch source[pos] {
-		case ' ', '\t', '\f':
-			pos++
-			endCol++
-		default:
-			return Token{}, false
-		}
-	}
-
-	return Token{
-		Symbol:     sym,
-		StartByte:  uint32(startPos),
-		EndByte:    uint32(pos),
-		StartPoint: startPoint,
-		EndPoint:   Point{Row: d.lexer.row, Column: endCol},
-	}, true
-}
-
-func (d *dfaTokenSource) syntheticJSXText(sym Symbol) (Token, bool) {
-	if d.lexer == nil {
-		return Token{}, false
-	}
-	source := d.lexer.source
-	startPos := d.lexer.pos
-	if startPos >= len(source) {
-		return Token{}, false
-	}
-
-	switch source[startPos] {
-	case '<', '{', '}':
-		return Token{}, false
-	}
-
-	pos := startPos
-	endRow := d.lexer.row
-	endCol := d.lexer.col
-
-	for pos < len(source) {
-		switch source[pos] {
-		case '<', '{', '}':
-			if pos == startPos {
-				return Token{}, false
-			}
-			startPoint := Point{Row: d.lexer.row, Column: d.lexer.col}
-			return Token{
-				Symbol:     sym,
-				StartByte:  uint32(startPos),
-				EndByte:    uint32(pos),
-				StartPoint: startPoint,
-				EndPoint:   Point{Row: endRow, Column: endCol},
-			}, true
-		case '\r':
-			pos++
-			if pos < len(source) && source[pos] == '\n' {
-				pos++
-			}
-			endRow++
-			endCol = 0
-		case '\n':
-			pos++
-			endRow++
-			endCol = 0
-		default:
-			_, size := utf8.DecodeRune(source[pos:])
-			if size <= 0 {
-				size = 1
-			}
-			pos += size
-			endCol++
-		}
-	}
-
-	if pos == startPos {
-		return Token{}, false
-	}
-	startPoint := Point{Row: d.lexer.row, Column: d.lexer.col}
-	return Token{
-		Symbol:     sym,
-		StartByte:  uint32(startPos),
-		EndByte:    uint32(pos),
-		StartPoint: startPoint,
-		EndPoint:   Point{Row: endRow, Column: endCol},
-	}, true
-}
-
-func (d *dfaTokenSource) promoteKeyword(tok Token) Token {
-	if d.language == nil {
-		return tok
-	}
-	if tok.Symbol == 0 {
-		return tok
-	}
-	if len(d.language.KeywordLexStates) == 0 {
-		return tok
-	}
-	if d.language.KeywordCaptureToken == 0 {
-		return tok
-	}
-	if tok.Symbol != d.language.KeywordCaptureToken {
-		return tok
-	}
-	if tok.EndByte <= tok.StartByte {
-		return tok
-	}
-
-	start := int(tok.StartByte)
-	end := int(tok.EndByte)
-	if start < 0 || end < start || end > len(d.lexer.source) {
-		return tok
-	}
-
-	kw := NewLexer(d.language.KeywordLexStates, d.lexer.source[start:end])
-	kwTok := kw.Next(0)
-	if kwTok.Symbol == 0 {
-		return tok
-	}
-	if kwTok.StartByte != 0 {
-		return tok
-	}
-	if kwTok.EndByte != uint32(end-start) {
-		return tok
-	}
-
-	// Only promote to keyword if the keyword symbol has a valid action in the
-	// current parse state. This mirrors C tree-sitter's ts_parser__advance,
-	// which checks ts_language_table_entry before accepting a keyword.
-	// Without this guard, keywords like `require` in TSX are always promoted
-	// even in contexts where only `identifier` is valid (e.g. call expressions),
-	// causing parse errors.
-	if d.lookupActionIndex != nil && d.lookupActionIndex(d.state, kwTok.Symbol) == 0 {
-		return tok
-	}
-
-	tok.Symbol = kwTok.Symbol
-	return tok
-}
-
-// resolveSymbolAlias handles grammars where the same lexeme has multiple
-// symbol IDs (e.g. '?' as both a ternary operator and an optional type
-// marker). The DFA lexer always produces one fixed symbol, but the parser
-// may expect a different one depending on state. When the DFA's symbol has
-// no valid action, this method tries each alternative symbol with the same
-// name and promotes to the first one that does.
-func (d *dfaTokenSource) resolveSymbolAlias(tok Token) Token {
-	if d.lookupActionIndex == nil || d.language == nil {
-		return tok
-	}
-	if tok.Symbol == 0 {
-		return tok
-	}
-	if d.lookupActionIndex(d.state, tok.Symbol) != 0 {
-		return tok
-	}
-	nameIdx := int(tok.Symbol)
-	if nameIdx >= len(d.language.SymbolNames) {
-		return tok
-	}
-	name := d.language.SymbolNames[nameIdx]
-	if name == "" {
-		return tok
-	}
-	for _, alt := range d.language.TokenSymbolsByName(name) {
-		if alt == tok.Symbol {
-			continue
-		}
-		if d.lookupActionIndex(d.state, alt) != 0 {
-			tok.Symbol = alt
-			return tok
-		}
-	}
-	return tok
-}
-
-// parseIterations returns the iteration limit scaled to input size.
-// A correctly-parsed file needs roughly (tokens * grammar_depth) iterations.
-// For typical source (~5 bytes/token, ~10 reduce depth), that's sourceLen*2.
-// We use sourceLen*20 as a generous upper bound that still prevents runaway
-// parsing from OOMing the machine.
-func parseIterations(sourceLen int) int {
-	return max(10_000, sourceLen*20)
-}
-
-// parseStackDepth returns the stack depth limit scaled to input size.
-func parseStackDepth(sourceLen int) int {
-	return max(1_000, sourceLen*2)
-}
-
-// parseNodeLimit returns the maximum number of Node allocations allowed.
-// This is the hard ceiling that prevents OOM regardless of iteration count.
-func parseNodeLimit(sourceLen int) int {
-	return max(50_000, sourceLen*10)
-}
-
-func parseErrorTree(source []byte, lang *Language) *Tree {
-	end := Point{}
-	for i := 0; i < len(source); {
-		if source[i] == '\n' {
-			end.Row++
-			end.Column = 0
-			i++
-			continue
-		}
-		_, size := utf8.DecodeRune(source[i:])
-		if size <= 0 {
-			size = 1
-		}
-		i += size
-		end.Column++
-	}
-
-	root := NewLeafNode(errorSymbol, false, 0, uint32(len(source)), Point{}, end)
-	root.hasError = true
-	return NewTree(root, source, lang)
-}
-
-func isWhitespaceOnlySource(source []byte) bool {
-	for i := 0; i < len(source); i++ {
-		switch source[i] {
-		case ' ', '\t', '\n', '\r', '\f':
-		default:
-			return false
-		}
-	}
-	return true
+	return bytes.Equal(oldSource, source)
 }
 
 // parseInternal is the core GLR parsing loop shared by Parse and
@@ -786,65 +197,242 @@ func isWhitespaceOnlySource(source []byte) bool {
 // action per table entry), there is exactly one stack and the algorithm
 // reduces to standard LR parsing. When multiple actions exist for a
 // (state, symbol) pair, the parser forks: one stack per alternative.
-// Stacks that error out are dropped. Stacks that converge to the same
-// top state are merged, keeping the highest dynamic-precedence version.
-func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor, oldTree *Tree, arenaClass arenaClass) *Tree {
+// Stacks that error out are dropped. Only duplicate stack versions are
+// merged; distinct alternatives are preserved.
+func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor, oldTree *Tree, arenaClass arenaClass, timing *incrementalParseTiming) *Tree {
+	var parseStart time.Time
+	if timing != nil {
+		parseStart = time.Now()
+	}
+	deferParentLinks := reuse == nil && oldTree == nil
 	if closer, ok := ts.(interface{ Close() }); ok {
 		defer closer.Close()
 	}
 	scratch := acquireParserScratch()
-	defer releaseParserScratch(scratch)
+	defer releaseParserScratch(scratch, deferParentLinks)
+	trackChildErrors := !deferParentLinks
 
 	arena := acquireNodeArena(arenaClass)
-	reusedAny := false
-
-	finalize := func(stacks []glrStack) *Tree {
-		return p.buildResultFromGLR(stacks, source, arena, oldTree, reusedAny)
+	arena.skipChildClear = reuse == nil && oldTree == nil
+	if timing != nil {
+		startUsed := arena.used
+		defer func() {
+			timing.totalNanos += time.Since(parseStart).Nanoseconds()
+			if arena.used >= startUsed {
+				timing.newNodes += uint64(arena.used - startUsed)
+			}
+			peak := uint64(scratch.entries.peakEntriesUsed())
+			if peak > timing.entryScratchPeak {
+				timing.entryScratchPeak = peak
+			}
+		}()
+	}
+	if arenaClass == arenaClassFull {
+		defer func() {
+			p.recordFullArenaUsage(arena.used)
+		}()
+	}
+	switch arenaClass {
+	case arenaClassFull:
+		arena.ensureNodeCapacity(parseFullArenaNodeCapacity(len(source), p.fullArenaHintCapacity()))
+		scratch.entries.ensureInitialCap(parseFullEntryScratchCapacity(len(source)))
+	case arenaClassIncremental:
+		arena.ensureNodeCapacity(parseIncrementalArenaNodeCapacity(len(source)))
+		scratch.entries.ensureInitialCap(parseIncrementalEntryScratchCapacity(len(source)))
+	}
+	var reuseState parseReuseState
+	nodeCount := 0
+	iterationsUsed := 0
+	peakStackDepth := 0
+	maxStacksSeen := 0
+	var perfTokensConsumed uint64
+	var lastTokenEndByte uint32
+	var lastTokenSymbol Symbol
+	var lastTokenWasEOF bool
+	tokenSourceEOFEarly := false
+	expectedEOFByte := uint32(len(source))
+	if len(p.included) > 0 {
+		expectedEOFByte = p.included[len(p.included)-1].EndByte
+	}
+	parseRuntime := ParseRuntime{
+		StopReason:      ParseStopNone,
+		SourceLen:       uint32(len(source)),
+		ExpectedEOFByte: expectedEOFByte,
+	}
+	finalizeTree := func(tree *Tree, stopReason ParseStopReason) *Tree {
+		if tokenSourceEOFEarly && (stopReason == ParseStopAccepted || stopReason == ParseStopNone) {
+			stopReason = ParseStopTokenSourceEOF
+		}
+		parseRuntime.StopReason = stopReason
+		parseRuntime.Iterations = iterationsUsed
+		parseRuntime.NodesAllocated = nodeCount
+		parseRuntime.PeakStackDepth = peakStackDepth
+		parseRuntime.MaxStacksSeen = maxStacksSeen
+		parseRuntime.TokensConsumed = perfTokensConsumed
+		parseRuntime.LastTokenEndByte = lastTokenEndByte
+		parseRuntime.LastTokenSymbol = lastTokenSymbol
+		parseRuntime.LastTokenWasEOF = lastTokenWasEOF
+		parseRuntime.TokenSourceEOFEarly = tokenSourceEOFEarly
+		parseRuntime.RootEndByte = 0
+		parseRuntime.Truncated = false
+		if tree != nil && tree.RootNode() != nil {
+			parseRuntime.RootEndByte = tree.RootNode().EndByte()
+			parseRuntime.Truncated = parseRuntime.RootEndByte < expectedEOFByte
+		}
+		if tree != nil {
+			tree.setParseRuntime(parseRuntime)
+		}
+		return tree
+	}
+	finalize := func(stacks []glrStack, stopReason ParseStopReason) *Tree {
+		tree := p.buildResultFromGLR(stacks, source, arena, oldTree, &reuseState, &scratch.nodeLinks)
+		return finalizeTree(tree, stopReason)
+	}
+	finalizeErrorTree := func(stopReason ParseStopReason) *Tree {
+		arena.Release()
+		return finalizeTree(parseErrorTree(source, p.language), stopReason)
 	}
 
-	stacks := []glrStack{newGLRStackWithScratch(p.language.InitialState, &scratch.entries)}
+	var stacksBuf [4]glrStack
+	stacks := stacksBuf[:1]
+	initialStackCap := 64 * 1024
+	if reuse != nil {
+		// Incremental reparses often borrow scratch slabs from an earlier full
+		// parse. Preallocating that full retained capacity forces large memclr
+		// work on every edit; keep incremental stack preallocation modest.
+		initialStackCap = defaultStackEntrySlabCap
+	}
+	stacks[0] = newGLRStackWithScratchCap(p.language.InitialState, &scratch.entries, initialStackCap)
+	stacks[0].recoverabilityKnown = true
+	stacks[0].mayRecover = p.stateCanRecover(p.language.InitialState)
+	maxStacksSeen = len(stacks)
+	if timing != nil && timing.maxStacksSeen < len(stacks) {
+		timing.maxStacksSeen = len(stacks)
+	}
+	maxStacks := parseMaxGLRStacksValue()
+	mergePerKeyCap := maxStacksPerMergeKey
+	if reuse != nil {
+		// Incremental reparses benefit from tighter GLR retention because
+		// edits are localized and we prioritize latency over broad ambiguity fanout.
+		if maxStacks > 32 {
+			maxStacks = 32
+		}
+		if mergePerKeyCap > 4 {
+			mergePerKeyCap = 4
+		}
+	}
+	scratch.merge.perKeyCap = mergePerKeyCap
 
 	maxIter := parseIterations(len(source))
 	maxDepth := parseStackDepth(len(source))
 	maxNodes := parseNodeLimit(len(source))
-	nodeCount := 0
+	parseRuntime.IterationLimit = maxIter
+	parseRuntime.StackDepthLimit = maxDepth
+	parseRuntime.NodeLimit = maxNodes
 
 	needToken := true
 	var tok Token
-	lastUnwindByte := int64(-1) // byte position of last unwind; -1 = no unwind yet
-	tokensOKSinceUnwind := 0   // count of tokens with valid actions since last unwind
 
 	// Per-primary-stack infinite-reduce detection.
 	var lastReduceState StateID
 	var consecutiveReduces int
 
 	for iter := 0; iter < maxIter; iter++ {
-		// Prune dead stacks and merge stacks with identical top states.
-		stacks = mergeStacksWithScratch(stacks, &scratch.merge)
-		if len(stacks) == 0 {
-			arena.Release()
-			return parseErrorTree(source, p.language)
+		iterationsUsed = iter + 1
+		if perfCountersEnabled {
+			perfRecordMaxConcurrentStacks(len(stacks))
+		}
+		if timing != nil && len(stacks) > timing.maxStacksSeen {
+			timing.maxStacksSeen = len(stacks)
+		}
+		if len(stacks) > maxStacksSeen {
+			maxStacksSeen = len(stacks)
+		}
+		// Fast-path the overwhelmingly common non-GLR case with one live stack.
+		if len(stacks) == 1 {
+			if stacks[0].dead {
+				return finalizeErrorTree(ParseStopNoStacksAlive)
+			}
+		} else {
+			// Prune dead stacks and collapse only truly duplicate stack versions.
+			stacks = mergeStacksWithScratch(stacks, &scratch.merge)
+			if len(stacks) == 0 {
+				return finalizeErrorTree(ParseStopNoStacksAlive)
+			}
+		}
+		// Cap the number of parallel stacks to prevent combinatorial explosion.
+		// Keep the most promising stacks instead of truncating by insertion
+		// order, which can discard viable parses on highly-ambiguous inputs.
+		if len(stacks) > maxStacks {
+			if perfCountersEnabled {
+				perfRecordGlobalCapCull(len(stacks), maxStacks)
+			}
+			stacks = retainTopStacks(stacks, maxStacks)
 		}
 
-		// Cap the number of parallel stacks to prevent combinatorial explosion.
-		const maxStacks = 64
-		if len(stacks) > maxStacks {
-			stacks = stacks[:maxStacks]
+		// Keep the most promising stack in slot 0 because several parser
+		// heuristics (lex-mode selection, reduce-loop detection, depth cap)
+		// currently key off the primary stack.
+		if len(stacks) > 1 {
+			p.promotePrimaryStack(stacks)
+		}
+		for i := range stacks {
+			stacks[i].cacheEntries = false
+			if stacks[i].gss.head != nil {
+				stacks[i].entries = nil
+			}
 		}
 
 		// Safety: if the primary stack has grown beyond the depth cap,
 		// or we've allocated too many nodes, return what we have.
-		if len(stacks[0].entries) > maxDepth || nodeCount > maxNodes {
-			return finalize(stacks)
+		primaryDepth := stacks[0].depth()
+		if primaryDepth > peakStackDepth {
+			peakStackDepth = primaryDepth
+		}
+		if primaryDepth > maxDepth {
+			return finalize(stacks, ParseStopStackDepthLimit)
+		}
+		if nodeCount > maxNodes {
+			return finalize(stacks, ParseStopNodeLimit)
 		}
 
 		// Use the primary (first) stack's state for DFA lex mode selection.
-		if dts, ok := ts.(*dfaTokenSource); ok {
-			dts.state = stacks[0].top().state
+		// Pass all active GLR stack states so external scanner valid symbols
+		// are computed as the union across all stacks.
+		if stateful, ok := ts.(parserStateTokenSource); ok {
+			stateful.SetParserState(stacks[0].top().state)
+			if len(stacks) > 1 {
+				glrBuf := scratch.glrStates[:0]
+				if cap(glrBuf) < len(stacks) {
+					glrBuf = make([]StateID, 0, len(stacks))
+				}
+				for si := range stacks {
+					if !stacks[si].dead {
+						glrBuf = append(glrBuf, stacks[si].top().state)
+					}
+				}
+				scratch.glrStates = glrBuf
+				stateful.SetGLRStates(glrBuf)
+			} else {
+				if len(scratch.glrStates) > 0 {
+					scratch.glrStates = scratch.glrStates[:0]
+				}
+				stateful.SetGLRStates(nil)
+			}
 		}
 
+		// --- Token acquisition and incremental reuse ---
 		if needToken {
 			tok = ts.Next()
+			perfTokensConsumed++
+			lastTokenEndByte = tok.EndByte
+			lastTokenSymbol = tok.Symbol
+			lastTokenWasEOF = tok.Symbol == 0 && tok.StartByte == tok.EndByte
+			if lastTokenWasEOF && tok.EndByte < expectedEOFByte {
+				tokenSourceEOFEarly = true
+			}
+			// Clear per-stack shifted flags so all stacks process the
+			// new token.
 			for si := range stacks {
 				stacks[si].shifted = false
 			}
@@ -853,63 +441,48 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 		// Incremental parsing fast-path: when there is a single active stack,
 		// try to reuse an unchanged subtree starting at the current token.
 		if reuse != nil && len(stacks) == 1 && !stacks[0].dead && tok.Symbol != 0 {
-			if nextTok, ok := p.tryReuseSubtree(&stacks[0], tok, ts, reuse, &scratch.entries); ok {
-				reusedAny = true
-				tok = nextTok
-				needToken = false
-				consecutiveReduces = 0
-				continue
+			if timing != nil {
+				reuseStart := time.Now()
+				nextTok, reusedBytes, ok := p.tryReuseSubtree(&stacks[0], tok, ts, reuse, &scratch.entries, &scratch.gss)
+				timing.reuseNanos += time.Since(reuseStart).Nanoseconds()
+				if ok {
+					timing.reusedSubtrees++
+					timing.reusedBytes += uint64(reusedBytes)
+					reuseState.markReused(stacks[0].top().node, arena)
+					tok = nextTok
+					needToken = false
+					consecutiveReduces = 0
+					continue
+				}
+			} else {
+				if nextTok, _, ok := p.tryReuseSubtree(&stacks[0], tok, ts, reuse, &scratch.entries, &scratch.gss); ok {
+					reuseState.markReused(stacks[0].top().node, arena)
+					tok = nextTok
+					needToken = false
+					consecutiveReduces = 0
+					continue
+				}
 			}
 		}
 
+		// --- Action application for all alive stacks ---
 		// Process all alive stacks for this token.
 		// We iterate by index because forks may append to `stacks`.
 		numStacks := len(stacks)
 		anyReduced := false
-		var reLexTok *Token // set when a GLR re-lex succeeds; applied after the loop
 
-		// Pre-check: does the primary stack have an action for this token?
-		// Used to decide whether to kill it when a re-lex succeeds elsewhere.
-		primaryHasAction := false
-		if len(stacks) > 0 && !stacks[0].dead && !stacks[0].shifted {
-			if a := p.lookupAction(stacks[0].top().state, tok.Symbol); a != nil && len(a.Actions) > 0 {
-				primaryHasAction = true
-			} else if tok.Symbol != 0 {
-				// Also check alias resolution.
-				if alt := p.resolveTokenAlias(stacks[0].top().state, tok.Symbol); alt != tok.Symbol {
-					if a2 := p.lookupAction(stacks[0].top().state, alt); a2 != nil && len(a2.Actions) > 0 {
-						primaryHasAction = true
-					}
-				}
-			}
-		}
-
+		parseActions := p.language.ParseActions
 		for si := 0; si < numStacks; si++ {
 			s := &stacks[si]
-			if s.dead {
-				continue
-			}
-			// Skip stacks that already consumed this token via SHIFT
-			// in a previous iteration (while other stacks were reducing).
-			if s.shifted {
-				if DebugGLR {
-					fmt.Fprintf(os.Stderr, "  GLR: skip stack[%d] state=%d (shifted)\n", si, s.top().state)
-				}
+			if s.dead || s.shifted {
 				continue
 			}
 
 			currentState := s.top().state
-			action := p.lookupAction(currentState, tok.Symbol)
-			if DebugGLR {
-				nact := 0
-				if action != nil {
-					nact = len(action.Actions)
-				}
-				symName := ""
-				if int(tok.Symbol) < len(p.language.SymbolNames) {
-					symName = p.language.SymbolNames[tok.Symbol]
-				}
-				fmt.Fprintf(os.Stderr, "  GLR: stack[%d] state=%d tok=%d(%s) actions=%d\n", si, currentState, tok.Symbol, symName, nact)
+			actionIdx := p.lookupActionIndex(currentState, tok.Symbol)
+			var actions []ParseAction
+			if actionIdx != 0 && int(actionIdx) < len(parseActions) {
+				actions = parseActions[actionIdx].Actions
 			}
 
 			// --- Symbol alias resolution ---
@@ -918,86 +491,38 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 			// symbol. After reductions the parser state may expect a
 			// different alias. Try alternatives before falling through to
 			// error recovery.
-			if (action == nil || len(action.Actions) == 0) && tok.Symbol != 0 {
+			if len(actions) == 0 && tok.Symbol != 0 {
 				if alt := p.resolveTokenAlias(currentState, tok.Symbol); alt != tok.Symbol {
 					tok.Symbol = alt
-					action = p.lookupAction(currentState, tok.Symbol)
+					actionIdx = p.lookupActionIndex(currentState, tok.Symbol)
+					if actionIdx != 0 && int(actionIdx) < len(parseActions) {
+						actions = parseActions[actionIdx].Actions
+					}
 				}
 			}
 
 			// --- Extra token handling (comments, whitespace) ---
-			if action != nil && len(action.Actions) > 0 &&
-				action.Actions[0].Type == ParseActionShift && action.Actions[0].Extra {
+			if len(actions) > 0 &&
+				actions[0].Type == ParseActionShift && actions[0].Extra {
 				named := p.isNamedSymbol(tok.Symbol)
 				leaf := newLeafNodeInArena(arena, tok.Symbol, named,
 					tok.StartByte, tok.EndByte, tok.StartPoint, tok.EndPoint)
 				leaf.isExtra = true
+				leaf.preGotoState = currentState
 				leaf.parseState = currentState
-				s.push(currentState, leaf, &scratch.entries)
+				p.pushStackNode(s, currentState, leaf, &scratch.entries, &scratch.gss)
 				nodeCount++
 				needToken = true
 				continue
 			}
 
-			// --- GLR re-lex: alternate stacks may need different tokens ---
-			// The DFA produces tokens using the primary stack's lex mode.
-			// Non-primary stacks in different parser states may have a
-			// different lex mode. If no action was found and this stack's
-			// lex mode differs, re-lex from the current byte position.
-			// On success, promote this stack's token and mark other stacks
-			// that also had no action for the original token as needing
-			// the re-lexed token.
-			stackTok := tok
-			if (action == nil || len(action.Actions) == 0) && si > 0 && tok.Symbol != 0 {
-				if dts, ok := ts.(*dfaTokenSource); ok {
-					thisLex := p.language.LexModes[currentState].LexState
-					primaryLex := p.language.LexModes[stacks[0].top().state].LexState
-					if thisLex != primaryLex {
-						origState := dts.state
-						origPos := dts.lexer.pos
-						dts.state = currentState
-						dts.lexer.pos = int(tok.StartByte)
-						altTok := dts.Next()
-						dts.state = origState
-						matched := false
-						if altTok.Symbol != tok.Symbol && altTok.Symbol != 0 {
-							altAction := p.lookupAction(currentState, altTok.Symbol)
-							if altAction != nil && len(altAction.Actions) > 0 {
-								if DebugGLR {
-									altName := ""
-									if int(altTok.Symbol) < len(p.language.SymbolNames) {
-										altName = p.language.SymbolNames[altTok.Symbol]
-									}
-									fmt.Fprintf(os.Stderr, "  GLR: re-lex stack[%d] state=%d → tok=%d(%s)\n", si, currentState, altTok.Symbol, altName)
-								}
-								stackTok = altTok
-								action = altAction
-								matched = true
-								saved := altTok
-								reLexTok = &saved
-								// Kill the primary stack if it had no action
-								// for the original token — it only survived
-								// via grammar-directed recovery, which is the
-								// wrong path when this stack's re-lex succeeds.
-								if !primaryHasAction && !stacks[0].dead {
-									stacks[0].dead = true
-								}
-							}
-						}
-						if !matched {
-							dts.lexer.pos = origPos
-						}
-					}
-				}
-			}
-
 			// --- No action: error handling ---
-			if action == nil || len(action.Actions) == 0 {
+			if len(actions) == 0 {
 				if tok.Symbol == 0 {
 					if tok.StartByte == tok.EndByte {
 						// True EOF. If this is the only stack, return result.
 						if len(stacks) == 1 {
-							return finalize(stacks)
+							return finalize(stacks, ParseStopAccepted)
 						}
 						// Multiple stacks at EOF: this one is done.
 						// Mark dead so merge picks the best remaining.
@@ -1009,86 +534,38 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 					continue
 				}
 
-				// Try grammar-directed recovery by searching the stack for
-				// the nearest state that can recover on this lookahead.
-				if depth, recoverAct, ok := p.findRecoverActionOnStack(s, tok.Symbol); ok {
-					s.entries = s.entries[:depth+1]
-					p.applyAction(s, recoverAct, tok, &anyReduced, &nodeCount, arena, &scratch.entries)
-					needToken = true
-					continue
-				}
-
-				// If other stacks have valid actions, kill this one.
+				// When multiple alternatives exist, drop no-action stacks
+				// immediately instead of running deep recovery scans.
 				if len(stacks) > 1 {
 					s.dead = true
 					continue
 				}
 
-				// Stack-unwinding ("panic mode") error recovery:
-				// Search the stack (top → bottom) for the shallowest state
-				// that has a valid non-RECOVER action (SHIFT or REDUCE) for
-				// the current token. If found, pop to that depth, wrap
-				// discarded nodes in an ERROR parent, and retry the token.
-				//
-				// Exception: if the token is a contextual keyword (e.g.
-				// "from") lexed as identifier, skip it first and let the
-				// next (more specific) token drive the unwind. This avoids
-				// unwinding into a generic identifier context and losing
-				// the current rule structure (e.g. import context).
-				skipUnwind := false
-				if tok.Symbol == p.language.KeywordCaptureToken &&
-					tok.EndByte > tok.StartByte &&
-					int64(tok.StartByte) != lastUnwindByte {
-					start := int(tok.StartByte)
-					end := int(tok.EndByte)
-					if start >= 0 && end <= len(source) {
-						kw := NewLexer(p.language.KeywordLexStates, source[start:end])
-						kwTok := kw.Next(0)
-						if kwTok.Symbol != 0 && kwTok.EndByte == uint32(end-start) {
-							skipUnwind = true
-						}
+				// Try grammar-directed recovery by searching the stack for
+				// the nearest state that can recover on this lookahead.
+				if depth, recoverAct, ok := p.findRecoverActionOnStack(s, tok.Symbol, timing); ok {
+					if !s.truncate(depth + 1) {
+						s.dead = true
+						continue
 					}
-				}
-				if !skipUnwind && (tokensOKSinceUnwind > 0 || lastUnwindByte < 0) {
-					if len(s.entries) > 1 {
-						if unwindDepth, ok := p.findUnwindTarget(s, tok.Symbol); ok {
-							var errChildren []*Node
-							for i := unwindDepth + 1; i < len(s.entries); i++ {
-								if s.entries[i].node != nil {
-									errChildren = append(errChildren, s.entries[i].node)
-								}
-							}
-							s.entries = s.entries[:unwindDepth+1]
-							if len(errChildren) > 0 {
-								if arena != nil {
-									ac := arena.allocNodeSlice(len(errChildren))
-									copy(ac, errChildren)
-									errChildren = ac
-								}
-								errParent := newParentNodeInArena(arena, errorSymbol, false, errChildren, nil, 0)
-								errParent.hasError = true
-								errParent.isExtra = true
-								errParent.parseState = s.entries[unwindDepth].state
-								s.push(s.entries[unwindDepth].state, errParent, &scratch.entries)
-								nodeCount++
-							}
-							lastUnwindByte = int64(tok.StartByte)
-							tokensOKSinceUnwind = 0
-							anyReduced = true
-							continue
-						}
-					}
+					p.applyAction(s, recoverAct, tok, &anyReduced, &nodeCount, arena, &scratch.entries, &scratch.gss, &scratch.tmpEntries, deferParentLinks, &trackChildErrors)
+					needToken = true
+					continue
 				}
 
 				// Only stack: error recovery — wrap token in error node.
-				if len(s.entries) == 0 {
-					return finalize(stacks)
+				if s.depth() == 0 {
+					return finalize(stacks, ParseStopNoStacksAlive)
 				}
 				errNode := newLeafNodeInArena(arena, errorSymbol, false,
 					tok.StartByte, tok.EndByte, tok.StartPoint, tok.EndPoint)
 				errNode.hasError = true
+				trackChildErrors = true
+				if perfCountersEnabled {
+					perfRecordErrorNode()
+				}
 				errNode.parseState = currentState
-				s.push(currentState, errNode, &scratch.entries)
+				p.pushStackNode(s, currentState, errNode, &scratch.entries, &scratch.gss)
 				nodeCount++
 				needToken = true
 				continue
@@ -1097,38 +574,55 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 			// --- GLR: fork for multiple actions ---
 			// For single-action entries (the common case), no fork occurs.
 			// For multi-action entries, clone the stack for each alternative.
-			// A successful action means the parser is making progress;
-			// count tokens with valid actions since last unwind.
-			if lastUnwindByte >= 0 && int64(stackTok.StartByte) > lastUnwindByte {
-				tokensOKSinceUnwind++
-			}
-			actions := action.Actions
 			if len(actions) > 1 {
-				if DebugGLR {
-					for ai, a := range actions {
-						fmt.Fprintf(os.Stderr, "  GLR: fork[%d] type=%d sym=%d state=%d children=%d\n", ai, a.Type, a.Symbol, a.State, a.ChildCount)
+				if perfCountersEnabled {
+					rrConflict, rsConflict := classifyConflictShape(actions)
+					switch {
+					case rrConflict:
+						perfRecordConflictRR()
+					case rsConflict:
+						perfRecordConflictRS()
+					default:
+						perfRecordConflictOther()
 					}
 				}
-				// Save state before applying any action.
-				saved := s.cloneWithScratch(&scratch.entries)
-				// Apply first action to the original stack.
-				p.applyAction(s, actions[0], stackTok, &anyReduced, &nodeCount, arena, &scratch.entries)
-				// Clone for each additional action.
+				if reuse != nil {
+					act := actions[0]
+					p.applyAction(s, act, tok, &anyReduced, &nodeCount, arena, &scratch.entries, &scratch.gss, &scratch.tmpEntries, deferParentLinks, &trackChildErrors)
+					continue
+				}
+				if perfCountersEnabled {
+					perfRecordFork(len(actions), perfTokensConsumed)
+				}
+				// Deep-stack GLR forks can trigger pathological clone volumes on
+				// very large inputs. At extreme depths, take the primary action
+				// to keep parsing bounded.
+				if s.depth() > maxForkCloneDepth {
+					act := actions[0]
+					p.applyAction(s, act, tok, &anyReduced, &nodeCount, arena, &scratch.entries, &scratch.gss, &scratch.tmpEntries, deferParentLinks, &trackChildErrors)
+					continue
+				}
+				// Copy the current stack value before appending forks.
+				// Appending can reallocate `stacks`, which would invalidate `s`.
+				base := *s
 				for ai := 1; ai < len(actions); ai++ {
-					fork := saved.cloneWithScratch(&scratch.entries)
-					p.applyAction(&fork, actions[ai], stackTok, &anyReduced, &nodeCount, arena, &scratch.entries)
+					fork := base.cloneWithScratch(&scratch.gss)
+					act := actions[ai]
+					p.applyAction(&fork, act, tok, &anyReduced, &nodeCount, arena, &scratch.entries, &scratch.gss, &scratch.tmpEntries, deferParentLinks, &trackChildErrors)
 					stacks = append(stacks, fork)
 				}
+				// Re-acquire the pointer after possible reallocation.
+				s = &stacks[si]
+				act := actions[0]
+				p.applyAction(s, act, tok, &anyReduced, &nodeCount, arena, &scratch.entries, &scratch.gss, &scratch.tmpEntries, deferParentLinks, &trackChildErrors)
 			} else {
-				p.applyAction(s, actions[0], stackTok, &anyReduced, &nodeCount, arena, &scratch.entries)
+				act := actions[0]
+				if act.Type == ParseActionReduce {
+					p.applyActionWithReduceChain(s, act, tok, &anyReduced, &nodeCount, arena, &scratch.entries, &scratch.gss, &scratch.tmpEntries, deferParentLinks, &trackChildErrors)
+				} else {
+					p.applyAction(s, act, tok, &anyReduced, &nodeCount, arena, &scratch.entries, &scratch.gss, &scratch.tmpEntries, deferParentLinks, &trackChildErrors)
+				}
 			}
-		}
-
-		// If a GLR re-lex produced a different token for a surviving stack,
-		// adopt it as the shared token so subsequent re-try iterations use
-		// the correct symbol (e.g. "=>" instead of "=").
-		if reLexTok != nil {
-			tok = *reLexTok
 		}
 
 		// After processing all stacks: determine whether to advance the
@@ -1147,7 +641,7 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 					lastReduceState = topState
 					consecutiveReduces = 1
 				}
-				if consecutiveReduces > 10 {
+				if consecutiveReduces > maxConsecutivePrimaryReduces {
 					needToken = true
 					consecutiveReduces = 0
 				}
@@ -1160,663 +654,73 @@ func (p *Parser) parseInternal(source []byte, ts TokenSource, reuse *reuseCursor
 		// Check for accept on any stack.
 		for si := range stacks {
 			if stacks[si].accepted {
-				return finalize(stacks[si : si+1])
+				return finalize(stacks[si:si+1], ParseStopAccepted)
 			}
 		}
 	}
 
 	// Iteration limit reached.
-	return finalize(stacks)
+	return finalize(stacks, ParseStopIterationLimit)
 }
 
-// applyAction applies a single parse action to a GLR stack.
-func (p *Parser) applyAction(s *glrStack, act ParseAction, tok Token, anyReduced *bool, nodeCount *int, arena *nodeArena, entryScratch *glrEntryScratch) {
-	switch act.Type {
-	case ParseActionShift:
-		named := p.isNamedSymbol(tok.Symbol)
-		leaf := newLeafNodeInArena(arena, tok.Symbol, named,
-			tok.StartByte, tok.EndByte, tok.StartPoint, tok.EndPoint)
-		leaf.isExtra = act.Extra
-		leaf.parseState = act.State
-		s.push(act.State, leaf, entryScratch)
-		s.shifted = true
-		*nodeCount++
-
-	case ParseActionReduce:
-		childCount := int(act.ChildCount)
-
-		// Find the start position by scanning backwards, counting only
-		// non-extra entries toward childCount. In tree-sitter's C runtime
-		// (ts_stack_pop_count / stack__iter), extras on the stack are
-		// skipped when counting children for a reduce action.
-		start := len(s.entries)
-		nonExtraFound := 0
-		for nonExtraFound < childCount && start > 1 {
-			start--
-			if s.entries[start].node != nil && !s.entries[start].node.isExtra {
-				nonExtraFound++
-			}
-		}
-		if nonExtraFound < childCount {
-			// Not enough stack entries — kill this stack version.
-			s.dead = true
-			return
-		}
-
-		// actualEntryCount includes extras interleaved between grammar symbols.
-		actualEntryCount := len(s.entries) - start
-		topState := s.entries[start-1].state
-
-		// Preserve raw span from reduced children while excluding pure extra
-		// padding, so parent ranges match the C runtime.
-		rawStartByte := uint32(0)
-		rawEndByte := uint32(0)
-		var rawStartPoint, rawEndPoint Point
-		rawHasStart := false
-		rawHasEnd := false
-		if actualEntryCount > 0 {
-			for i := 0; i < actualEntryCount; i++ {
-				if b, pt, ok := spanStartExcludingExtra(p.language, s.entries[start+i].node); ok {
-					rawStartByte = b
-					rawStartPoint = pt
-					rawHasStart = true
-					break
-				}
-			}
-			for i := actualEntryCount - 1; i >= 0; i-- {
-				if b, pt, ok := spanEndExcludingExtra(p.language, s.entries[start+i].node); ok {
-					rawEndByte = b
-					rawEndPoint = pt
-					rawHasEnd = true
-					break
-				}
-			}
-			firstRaw := s.entries[start].node
-			lastRaw := s.entries[start+actualEntryCount-1].node
-			if !rawHasStart && firstRaw != nil {
-				rawStartByte = firstRaw.startByte
-				rawStartPoint = firstRaw.startPoint
-			}
-			if !rawHasEnd && lastRaw != nil {
-				rawEndByte = lastRaw.endByte
-				rawEndPoint = lastRaw.endPoint
-			}
-		}
-
-		// Inline child normalization to keep normalized child slices in arena
-		// storage and avoid per-reduce heap allocations.
-		normalizedCount := 0
-		structuralChildIndex := 0
-		for i := 0; i < actualEntryCount; i++ {
-			n := s.entries[start+i].node
-			effectiveSymbol := n.symbol
-			if !n.isExtra {
-				if alias := p.aliasSymbolForChild(act.ProductionID, structuralChildIndex); alias != 0 {
-					effectiveSymbol = alias
-				}
-				structuralChildIndex++
-			}
-			if symbolVisible(p.language, effectiveSymbol) {
-				normalizedCount++
-			} else {
-				normalizedCount += len(n.children)
-			}
-		}
-
-		rawFieldIDs, hasInherited := p.buildFieldIDs(childCount, act.ProductionID, arena)
-		hasFields := false
-		for _, fid := range rawFieldIDs {
-			if fid != 0 {
-				hasFields = true
-				break
-			}
-		}
-
-		// When inherited entries exist, hidden children being flattened may
-		// carry their own field IDs that must be preserved in the parent.
-		if !hasFields && hasInherited {
-			for i := 0; i < actualEntryCount; i++ {
-				n := s.entries[start+i].node
-				if !n.isExtra && !symbolVisible(p.language, n.symbol) && n.fieldIDs != nil {
-					hasFields = true
-					break
-				}
-			}
-		}
-
-		children := arena.allocNodeSlice(normalizedCount)
-		var fieldIDs []FieldID
-		if hasFields {
-			fieldIDs = arena.allocFieldIDSlice(normalizedCount)
-		}
-
-		out := 0
-		structuralChildIndex = 0
-		for i := 0; i < actualEntryCount; i++ {
-			n := s.entries[start+i].node
-			var fid FieldID
-			if !n.isExtra {
-				if structuralChildIndex < len(rawFieldIDs) {
-					fid = rawFieldIDs[structuralChildIndex]
-				}
-				if alias := p.aliasSymbolForChild(act.ProductionID, structuralChildIndex); alias != 0 {
-					n = aliasedNodeInArena(arena, p.language, n, alias)
-				}
-				structuralChildIndex++
-			}
-			if symbolVisible(p.language, n.symbol) {
-				children[out] = n
-				if fieldIDs != nil {
-					fieldIDs[out] = fid
-				}
-				out++
-				continue
-			}
-
-			// Flatten hidden node's children into the parent.
-			// Preserve the hidden node's own field IDs (from its production)
-			// which correctly resolve inherited fields.
-			for j, child := range n.children {
-				children[out] = child
-				if fieldIDs != nil {
-					if j < len(n.fieldIDs) && n.fieldIDs[j] != 0 {
-						fieldIDs[out] = n.fieldIDs[j]
-					} else if j == 0 {
-						fieldIDs[out] = fid
-					} else {
-						fieldIDs[out] = 0
-					}
-				}
-				out++
-			}
-		}
-
-		// Pop all reduced entries in one step after collection.
-		s.entries = s.entries[:start]
-
-		named := p.isNamedSymbol(act.Symbol)
-		parent := newParentNodeInArena(arena, act.Symbol, named, children, fieldIDs, act.ProductionID)
-		if actualEntryCount > 0 {
-			parent.startByte = rawStartByte
-			parent.endByte = rawEndByte
-			parent.startPoint = rawStartPoint
-			parent.endPoint = rawEndPoint
-		}
-		*nodeCount++
-
-		gotoState := p.lookupGoto(topState, act.Symbol)
-		targetState := topState
-		if gotoState != 0 {
-			targetState = gotoState
-		}
-		parent.parseState = targetState
-		s.push(targetState, parent, entryScratch)
-
-		s.score += int(act.DynamicPrecedence)
-		*anyReduced = true
-
-	case ParseActionAccept:
-		s.accepted = true
-
-	case ParseActionRecover:
-		if tok.Symbol == 0 && tok.StartByte == tok.EndByte {
-			s.accepted = true
-			return
-		}
-		errNode := newLeafNodeInArena(arena, errorSymbol, false,
-			tok.StartByte, tok.EndByte, tok.StartPoint, tok.EndPoint)
-		errNode.hasError = true
-		recoverState := s.top().state
-		if act.State != 0 {
-			recoverState = act.State
-		}
-		errNode.parseState = recoverState
-		s.push(recoverState, errNode, entryScratch)
-		*nodeCount++
+func (p *Parser) promotePrimaryStack(stacks []glrStack) {
+	if len(stacks) <= 1 {
+		return
 	}
-}
-
-func recoverAction(entry *ParseActionEntry) (ParseAction, bool) {
-	if entry == nil {
-		return ParseAction{}, false
-	}
-	for _, act := range entry.Actions {
-		if act.Type == ParseActionRecover {
-			return act, true
-		}
-	}
-	return ParseAction{}, false
-}
-
-func (p *Parser) findRecoverActionOnStack(s *glrStack, sym Symbol) (int, ParseAction, bool) {
-	if s == nil || len(s.entries) == 0 {
-		return 0, ParseAction{}, false
-	}
-	for depth := len(s.entries) - 1; depth >= 0; depth-- {
-		state := s.entries[depth].state
-		action := p.lookupAction(state, sym)
-		if act, ok := recoverAction(action); ok {
-			return depth, act, true
-		}
-	}
-	return 0, ParseAction{}, false
-}
-
-// findUnwindTarget searches the stack from top to bottom for the shallowest
-// state that has a non-extra SHIFT action for the given lookahead symbol.
-// SHIFT is required (not REDUCE) because after unwinding, the error node
-// is marked as extra; a SHIFT directly consumes the token and advances the
-// parse, whereas a REDUCE may loop if the error node doesn't count toward
-// the reduce's child count. Returns the depth index and true if found.
-func (p *Parser) findUnwindTarget(s *glrStack, sym Symbol) (int, bool) {
-	if s == nil || len(s.entries) <= 1 {
-		return 0, false
-	}
-	for depth := len(s.entries) - 2; depth >= 0; depth-- {
-		state := s.entries[depth].state
-		action := p.lookupAction(state, sym)
-		if action == nil || len(action.Actions) == 0 {
-			continue
-		}
-		act := action.Actions[0]
-		if act.Type == ParseActionShift && !act.Extra {
-			return depth, true
-		}
-	}
-	return 0, false
-}
-
-func (p *Parser) aliasSymbolForChild(productionID uint16, childIndex int) Symbol {
-	if p == nil || p.language == nil || childIndex < 0 {
-		return 0
-	}
-	pid := int(productionID)
-	if pid < 0 || pid >= len(p.language.AliasSequences) {
-		return 0
-	}
-	seq := p.language.AliasSequences[pid]
-	if childIndex >= len(seq) {
-		return 0
-	}
-	return seq[childIndex]
-}
-
-func aliasedNodeInArena(arena *nodeArena, lang *Language, n *Node, alias Symbol) *Node {
-	if n == nil || alias == 0 || n.symbol == alias {
-		return n
-	}
-
-	if arena == nil {
-		cloned := &Node{}
-		*cloned = *n
-		cloned.symbol = alias
-		if lang != nil && int(alias) < len(lang.SymbolMetadata) {
-			cloned.isNamed = lang.SymbolMetadata[alias].Named
-		}
-		return cloned
-	}
-
-	cloned := arena.allocNode()
-	*cloned = *n
-	cloned.symbol = alias
-	if lang != nil && int(alias) < len(lang.SymbolMetadata) {
-		cloned.isNamed = lang.SymbolMetadata[alias].Named
-	}
-	cloned.ownerArena = arena
-	return cloned
-}
-
-func spanStartExcludingExtra(_ *Language, n *Node) (uint32, Point, bool) {
-	if n == nil {
-		return 0, Point{}, false
-	}
-	if n.isExtra {
-		return 0, Point{}, false
-	}
-	// All non-extra nodes contribute their range to the parent.
-	// Hidden (anonymous) terminals and parent nodes with already-computed
-	// ranges are all valid span contributors.  Only extras are excluded.
-	return n.startByte, n.startPoint, true
-}
-
-func spanEndExcludingExtra(_ *Language, n *Node) (uint32, Point, bool) {
-	if n == nil {
-		return 0, Point{}, false
-	}
-	if n.isExtra {
-		return 0, Point{}, false
-	}
-	return n.endByte, n.endPoint, true
-}
-
-// buildFieldIDs creates the field ID slice for a reduce action.
-// hasInherited reports whether the production contains inherited field
-// entries whose fields are defined inside hidden child sub-productions.
-func (p *Parser) buildFieldIDs(childCount int, productionID uint16, arena *nodeArena) (fieldIDs []FieldID, hasInherited bool) {
-	if childCount <= 0 || len(p.language.FieldMapEntries) == 0 {
-		return nil, false
-	}
-
-	pid := int(productionID)
-	if pid >= len(p.language.FieldMapSlices) {
-		return nil, false
-	}
-
-	fm := p.language.FieldMapSlices[pid]
-	count := int(fm[1])
-	if count == 0 {
-		return nil, false
-	}
-
-	fieldIDs = arena.allocFieldIDSlice(childCount)
-	start := int(fm[0])
-	assigned := false
-	for i := 0; i < count; i++ {
-		entryIdx := start + i
-		if entryIdx >= len(p.language.FieldMapEntries) {
-			break
-		}
-		entry := p.language.FieldMapEntries[entryIdx]
-		if entry.Inherited {
-			hasInherited = true
-			continue
-		}
-		if int(entry.ChildIndex) < len(fieldIDs) {
-			fieldIDs[entry.ChildIndex] = entry.FieldID
-			assigned = true
-		}
-	}
-
-	if !assigned && !hasInherited {
-		return nil, false
-	}
-	return fieldIDs, hasInherited
-}
-
-// buildResultFromGLR picks the best stack and constructs the final tree.
-// Prefers accepted stacks, then highest score, then most entries.
-func (p *Parser) buildResultFromGLR(stacks []glrStack, source []byte, arena *nodeArena, oldTree *Tree, reusedAny bool) *Tree {
-	if len(stacks) == 0 {
-		arena.Release()
-		return parseErrorTree(source, p.language)
-	}
-
 	best := 0
 	for i := 1; i < len(stacks); i++ {
-		if stacks[i].dead && !stacks[best].dead {
-			continue
-		}
-		if !stacks[i].dead && stacks[best].dead {
-			best = i
-			continue
-		}
-		if stacks[i].accepted && !stacks[best].accepted {
-			best = i
-			continue
-		}
-		if stacks[i].score > stacks[best].score {
-			best = i
-			continue
-		}
-		if stacks[i].score == stacks[best].score && len(stacks[i].entries) > len(stacks[best].entries) {
+		if stackComparePtr(&stacks[i], &stacks[best]) > 0 {
 			best = i
 		}
 	}
-
-	return p.buildResult(stacks[best].entries, source, arena, oldTree, reusedAny)
+	if best != 0 {
+		stacks[0], stacks[best] = stacks[best], stacks[0]
+	}
 }
 
-// lookupAction looks up the parse action for the given state and symbol.
-func (p *Parser) lookupAction(state StateID, sym Symbol) *ParseActionEntry {
-	idx := p.lookupActionIndex(state, sym)
-	if idx == 0 {
-		return nil
+func retainTopStacks(stacks []glrStack, keep int) []glrStack {
+	if keep <= 0 {
+		return stacks[:0]
 	}
-	if int(idx) < len(p.language.ParseActions) {
-		return &p.language.ParseActions[idx]
+	if len(stacks) <= keep {
+		return stacks
 	}
-	return nil
+	for i := 0; i < keep; i++ {
+		best := i
+		for j := i + 1; j < len(stacks); j++ {
+			if stackComparePtr(&stacks[j], &stacks[best]) > 0 {
+				best = j
+			}
+		}
+		if best != i {
+			stacks[i], stacks[best] = stacks[best], stacks[i]
+		}
+	}
+	return stacks[:keep]
 }
 
-// lookupActionIndex returns the parse action index for (state, symbol).
-// Returns 0 (the error/no-action entry) if not found.
-func (p *Parser) lookupActionIndex(state StateID, sym Symbol) uint16 {
-	useDense := false
-	if p.language.LargeStateCount > 0 {
-		useDense = uint32(state) < p.language.LargeStateCount
-	} else if len(p.language.ParseTable) > 0 {
-		useDense = int(state) < len(p.language.ParseTable)
+func classifyConflictShape(actions []ParseAction) (rrConflict, rsConflict bool) {
+	if len(actions) < 2 {
+		return false, false
 	}
-
-	if useDense {
-		if int(state) < len(p.language.ParseTable) {
-			row := p.language.ParseTable[state]
-			if int(sym) < len(row) {
-				return row[sym]
-			}
-		}
-		return 0
-	}
-
-	// Small (compressed sparse) table lookup.
-	smallIdx := int(state) - int(p.language.LargeStateCount)
-	if smallIdx < 0 || smallIdx >= len(p.language.SmallParseTableMap) {
-		return 0
-	}
-	offset := p.language.SmallParseTableMap[smallIdx]
-	table := p.language.SmallParseTable
-	if int(offset) >= len(table) {
-		return 0
-	}
-
-	groupCount := table[offset]
-	pos := int(offset) + 1
-	for i := uint16(0); i < groupCount; i++ {
-		if pos+1 >= len(table) {
-			break
-		}
-		sectionValue := table[pos]
-		symbolCount := table[pos+1]
-		pos += 2
-		for j := uint16(0); j < symbolCount; j++ {
-			if pos >= len(table) {
-				break
-			}
-			if table[pos] == uint16(sym) {
-				return sectionValue
-			}
-			pos++
+	reduceCount := 0
+	hasShift := false
+	hasOther := false
+	for i := range actions {
+		switch actions[i].Type {
+		case ParseActionReduce:
+			reduceCount++
+		case ParseActionShift:
+			hasShift = true
+		default:
+			hasOther = true
 		}
 	}
-	return 0
-}
-
-// resolveTokenAlias tries to find an alternative symbol with the same
-// display name that has a valid action in the given parser state. This
-// handles grammars where the same lexeme has multiple symbol IDs and the
-// DFA lexer always produces one fixed ID. Returns sym unchanged if no
-// better alternative is found.
-func (p *Parser) resolveTokenAlias(state StateID, sym Symbol) Symbol {
-	if p.language == nil {
-		return sym
+	if hasOther || reduceCount == 0 {
+		return false, false
 	}
-	nameIdx := int(sym)
-	if nameIdx >= len(p.language.SymbolNames) {
-		return sym
+	if hasShift {
+		return false, true
 	}
-	name := p.language.SymbolNames[nameIdx]
-	if name == "" {
-		return sym
-	}
-	for _, alt := range p.language.TokenSymbolsByName(name) {
-		if alt == sym {
-			continue
-		}
-		if p.lookupActionIndex(state, alt) != 0 {
-			return alt
-		}
-	}
-	return sym
-}
-
-// lookupGoto returns the GOTO target state for a nonterminal symbol.
-func (p *Parser) lookupGoto(state StateID, sym Symbol) StateID {
-	raw := p.lookupActionIndex(state, sym)
-	if raw == 0 {
-		return 0
-	}
-
-	// ts2go-generated grammars encode nonterminal GOTO values directly as
-	// parser state IDs. Hand-built grammars encode parse-action indices.
-	// ts2go always sets InitialState=1 (tree-sitter convention); hand-built
-	// grammars default to InitialState=0.
-	if p.language.TokenCount > 0 &&
-		uint32(sym) >= p.language.TokenCount &&
-		p.language.StateCount > 0 &&
-		p.language.InitialState > 0 {
-		return StateID(raw)
-	}
-
-	// Hand-built grammar or terminal symbol: look up in parse actions.
-	if int(raw) < len(p.language.ParseActions) {
-		entry := &p.language.ParseActions[raw]
-		if len(entry.Actions) > 0 && entry.Actions[0].Type == ParseActionShift {
-			return entry.Actions[0].State
-		}
-	}
-	return 0
-}
-
-// isNamedSymbol checks whether a symbol is a named symbol.
-func (p *Parser) isNamedSymbol(sym Symbol) bool {
-	if int(sym) < len(p.language.SymbolMetadata) {
-		return p.language.SymbolMetadata[sym].Named
-	}
-	return false
-}
-
-// buildResult constructs the final Tree from a stack of entries.
-func (p *Parser) buildResult(stack []stackEntry, source []byte, arena *nodeArena, oldTree *Tree, reusedAny bool) *Tree {
-	var nodes []*Node
-	for _, entry := range stack {
-		if entry.node != nil {
-			nodes = append(nodes, entry.node)
-		}
-	}
-
-	if len(nodes) == 0 {
-		arena.Release()
-		if isWhitespaceOnlySource(source) {
-			return NewTree(nil, source, p.language)
-		}
-		return parseErrorTree(source, p.language)
-	}
-
-	if arena != nil && arena.used == 0 {
-		arena.Release()
-		arena = nil
-	}
-
-	borrowed := retainBorrowedArenas(oldTree, reusedAny)
-	expectedRootSymbol := Symbol(0)
-	hasExpectedRoot := false
-	if oldTree != nil && oldTree.RootNode() != nil {
-		expectedRootSymbol = oldTree.RootNode().symbol
-		hasExpectedRoot = true
-	}
-
-	if len(nodes) == 1 {
-		candidate := nodes[0]
-		if !hasExpectedRoot || candidate.symbol == expectedRootSymbol {
-			return newTreeWithArenas(candidate, source, p.language, arena, borrowed)
-		}
-
-		// Incremental reuse guard: if the only stacked node doesn't match the
-		// previous root symbol, synthesize an expected root wrapper instead of
-		// returning a reused child as the new tree root.
-		rootChildren := make([]*Node, 1)
-		rootChildren[0] = candidate
-		if arena != nil {
-			rootChildren = arena.allocNodeSlice(1)
-			rootChildren[0] = candidate
-		}
-		root := newParentNodeInArena(arena, expectedRootSymbol, true, rootChildren, nil, 0)
-		return newTreeWithArenas(root, source, p.language, arena, borrowed)
-	}
-
-	// When multiple nodes remain on the stack, check whether all but one
-	// are extras (e.g. leading whitespace/comments). If so, fold the extras
-	// into the real root rather than wrapping everything in an error node.
-	var realRoot *Node
-	var extras []*Node
-	for _, n := range nodes {
-		if n.isExtra {
-			extras = append(extras, n)
-		} else {
-			if realRoot != nil {
-				realRoot = nil // more than one non-extra → genuine error
-				break
-			}
-			realRoot = n
-		}
-	}
-	if realRoot != nil && len(extras) > 0 {
-		// Fold extras into the real root as leading/trailing children.
-		merged := make([]*Node, 0, len(extras)+len(realRoot.children))
-		for _, e := range extras {
-			if e.startByte <= realRoot.startByte {
-				merged = append(merged, e)
-			}
-		}
-		merged = append(merged, realRoot.children...)
-		for _, e := range extras {
-			if e.startByte > realRoot.startByte {
-				merged = append(merged, e)
-			}
-		}
-		if arena != nil {
-			out := arena.allocNodeSlice(len(merged))
-			copy(out, merged)
-			merged = out
-		}
-		realRoot.children = merged
-		// Extend root range to cover the extras.
-		for _, e := range extras {
-			if e.startByte < realRoot.startByte {
-				realRoot.startByte = e.startByte
-				realRoot.startPoint = e.startPoint
-			}
-			if e.endByte > realRoot.endByte {
-				realRoot.endByte = e.endByte
-				realRoot.endPoint = e.endPoint
-			}
-		}
-		if !hasExpectedRoot || realRoot.symbol == expectedRootSymbol {
-			return newTreeWithArenas(realRoot, source, p.language, arena, borrowed)
-		}
-	}
-
-	rootChildren := nodes
-	// Grammar root symbol: first non-terminal = Symbol(TokenCount).
-	rootSymbol := Symbol(p.language.TokenCount)
-	if hasExpectedRoot {
-		rootSymbol = expectedRootSymbol
-	}
-	root := newParentNodeInArena(arena, rootSymbol, true, rootChildren, nil, 0)
-	root.hasError = true
-	return newTreeWithArenas(root, source, p.language, arena, borrowed)
-}
-
-func retainBorrowedArenas(oldTree *Tree, reusedAny bool) []*nodeArena {
-	if !reusedAny || oldTree == nil {
-		return nil
-	}
-	refs := oldTree.referencedArenas()
-	if len(refs) == 0 {
-		return nil
-	}
-	for _, a := range refs {
-		a.Retain()
-	}
-	return refs
+	return reduceCount >= 2, false
 }
