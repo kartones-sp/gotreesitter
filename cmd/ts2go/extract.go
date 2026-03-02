@@ -1278,6 +1278,14 @@ func parseReduceActionArgs(args string, g *ExtractedGrammar) (ExtractedAction, e
 		return ExtractedAction{}, fmt.Errorf("reduce expects at least symbol and child count")
 	}
 
+	// Detect named-field syntax used by newer tree-sitter versions:
+	//   REDUCE(.symbol = sym_name, .child_count = N [, .dynamic_precedence = N] [, .production_id = N])
+	// vs legacy positional syntax:
+	//   REDUCE(sym_name, N [, prec [, prod_id]])
+	if strings.Contains(fields[0], "=") {
+		return parseReduceNamedFields(fields, g)
+	}
+
 	symStr := strings.TrimSpace(fields[0])
 	sym, _ := g.resolveSymbol(symStr)
 	childCount, err := strconv.Atoi(strings.TrimSpace(fields[1]))
@@ -1327,6 +1335,51 @@ func parseReduceActionArgs(args string, g *ExtractedGrammar) (ExtractedAction, e
 		action.ProductionID = numericExtras[1]
 	}
 
+	return action, nil
+}
+
+func parseReduceNamedFields(fields []string, g *ExtractedGrammar) (ExtractedAction, error) {
+	action := ExtractedAction{Type: "reduce"}
+	gotSymbol := false
+	gotChildCount := false
+
+	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		key, value, ok := strings.Cut(field, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(key), "."))
+		value = strings.TrimSpace(value)
+
+		switch key {
+		case "symbol":
+			sym, _ := g.resolveSymbol(value)
+			action.Symbol = sym
+			gotSymbol = true
+		case "child_count":
+			n, err := strconv.Atoi(value)
+			if err != nil {
+				return ExtractedAction{}, fmt.Errorf("reduce .child_count: %w", err)
+			}
+			action.ChildCount = n
+			gotChildCount = true
+		case "dynamic_precedence", "precedence", "prec":
+			n, err := strconv.Atoi(value)
+			if err == nil {
+				action.Precedence = n
+			}
+		case "production_id":
+			n, err := strconv.Atoi(value)
+			if err == nil {
+				action.ProductionID = n
+			}
+		}
+	}
+
+	if !gotSymbol || !gotChildCount {
+		return ExtractedAction{}, fmt.Errorf("reduce named fields missing .symbol or .child_count")
+	}
 	return action, nil
 }
 

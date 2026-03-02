@@ -58,6 +58,11 @@ func loadEmbeddedLanguage(blobName string) *gotreesitter.Language {
 	entry := getEmbeddedLanguageCacheEntry(blobName)
 	entry.once.Do(func() {
 		entry.lang, entry.err = decodeEmbeddedLanguage(blobName)
+		if entry.err == nil && entry.lang.ExternalScanner == nil {
+			if scanner, ok := blobScannerMap[blobName]; ok {
+				entry.lang.ExternalScanner = scanner
+			}
+		}
 	})
 	if entry.err != nil {
 		panic(entry.err)

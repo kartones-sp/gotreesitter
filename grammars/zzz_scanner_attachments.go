@@ -14,6 +14,12 @@ import "github.com/odvcencio/gotreesitter"
 // This file starts with "zzz_" to ensure it runs AFTER all
 // *_register.go files, so registry entries exist when this init runs.
 
+// blobScannerMap maps grammar blob names (e.g. "scss.bin") to their
+// external scanner implementations. loadEmbeddedLanguage consults this
+// map so that direct calls like ScssLanguage() get scanners attached
+// without going through the registry.
+var blobScannerMap map[string]gotreesitter.ExternalScanner
+
 func init() {
 	attachments := map[string]gotreesitter.ExternalScanner{
 		"python":  PythonExternalScanner{},
@@ -128,6 +134,11 @@ func init() {
 		"rst":             RstExternalScanner{},
 		"haskell":         HaskellExternalScanner{},
 		"vhdl":            VhdlExternalScanner{},
+	}
+
+	blobScannerMap = make(map[string]gotreesitter.ExternalScanner, len(attachments))
+	for name, scanner := range attachments {
+		blobScannerMap[name+".bin"] = scanner
 	}
 
 	for i := range registry {
